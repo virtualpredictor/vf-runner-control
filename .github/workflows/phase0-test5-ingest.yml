@@ -1,0 +1,354 @@
+name: Phase 0 Test 5 — Dispatch & Signed Ingest Callback
+
+on:
+  repository_dispatch:
+    types: [phase0_test5_heartbeat, phase0_test5_collect]
+
+permissions:
+  contents: read
+
+jobs:
+  execute-and-callback:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Execute dispatched job and send HMAC-signed batch to staging Worker
+        env:
+          EVENT_TYPE: ${{ github.event.action }}
+          JOB_ID: ${{ github.event.client_payload.job_id }}
+          DISPATCHED_AT_MS: ${{ github.event.client_payload.dispatched_at_ms }}
+          CALLBACK_URL: ${{ github.event.client_payload.callback_url }}
+          INGEST_HMAC_SECRET: ${{ secrets.INGEST_HMAC_SECRET }}
+          VIRTUSTEC_HW_ID: ${{ secrets.VIRTUSTEC_HW_ID }}
+          GITHUB_RUN_ID: ${{ github.run_id }}
+        run: |
+          node --input-type=module << 'EOF'
+          import crypto from 'node:crypto';
+
+          const runnerStartedAtMs = Date.now();
+          const eventType = process.env.EVENT_TYPE || 'phase0_test5_heartbeat';
+          const jobId = process.env.JOB_ID || `job-${runnerStartedAtMs}`;
+          const dispatchedAtMs = Number(process.env.DISPATCHED_AT_MS || runnerStartedAtMs);
+          const callbackUrl = process.env.CALLBACK_URL;
+          const hmacSecret = process.env.INGEST_HMAC_SECRET;
+          const queueDelayMs = runnerStartedAtMs - dispatchedAtMs;
+
+          if (!callbackUrl || !hmacSecret) {
+            throw new Error('Missing CALLBACK_URL or INGEST_HMAC_SECRET');
+          }
+
+          function signPayload(secret, tsSec, rawBody) {
+            return 'sha256=' + crypto.createHmac('sha256', secret).update(`${tsSec}.${rawBody}`).digest('hex');
+          }
+
+          function parseBetPawaRawMarkets(event) {
+            const odds = { over_1_5: null, over_2_5: null, under_2_5: null, gg: null, ng: null };
+            if (!event || !Array.isArray(event.markets)) return odds;
+            for (const m of event.markets) {
+              const mId = String(m.marketType?.id || '');
+              const mName = m.marketType?.name || '';
+              if (mId === '5000' || mName.includes('Total Score Over/Under')) {
+                for (const r of (m.row || [])) {
+                  const total = r.specifier?.total || r.prices?.[0]?.handicap;
+                  const over = (r.prices || []).find(p => p.name?.toLowerCase() === 'over');
+                  const under = (r.prices || []).find(p => p.name?.toLowerCase() === 'under');
+                  if (total === '1.5' && over?.odds) odds.over_1_5 = Number(over.odds);
+                  if (total === '2.5') {
+                    if (over?.odds) odds.over_2_5 = Number(over.odds);
+                    if (under?.odds) odds.under_2_5 = Number(under.odds);
+                  }
+                }
+              } else if (mId === '3795' || mName.includes('Both Teams To Score')) {
+                const yes = m.row?.[0]?.prices?.find(p => p.name?.toLowerCase() === 'yes');
+                const no = m.row?.[0]?.prices?.find(p => p.name?.toLowerCase() === 'no');
+                if (yes?.odds) odds.gg = Number(yes.odds);
+                if (no?.odds) odds.ng = Number(no.odds);
+              }
+            }
+            return odds;
+          }
+
+          function parseSettledScore(event) {
+            const hp = event.results?.participantPeriodResults?.find(p => p.participant?.type === 'HOME');
+            const ap = event.results?.participantPeriodResults?.find(p => p.participant?.type === 'AWAY');
+            const hs = hp?.periodResults?.find(pr => pr.period?.slug === 'FULL_TIME_EXCLUDING_OVERTIME')?.result;
+            const as = ap?.periodResults?.find(pr => pr.period?.slug === 'FULL_TIME_EXCLUDING_OVERTIME')?.result;
+            if (hs !== undefined && as !== undefined && hs !== '' && as !== '') return `${hs}-${as}`;
+            return null;
+          }
+
+          async function collectBetPawaRounds() {
+            const t0 = performance.now();
+            const BASE = 'https://www.betpawa.ng';
+            const HEADERS = {
+              'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+              'Accept': 'application/json, text/plain, */*',
+              'X-Pawa-Brand': 'betpawa-nigeria',
+              'X-Pawa-Language': 'en'
+            };
+            const roundsOut = [];
+            const resSeasons = await fetch(`${BASE}/api/sportsbook/virtual/v2/seasons/list/actual`, { headers: HEADERS });
+            const seasonsData = await resSeasons.json();
+            const items = seasonsData.items || [];
+            const now = Date.now();
+            const activeSeason = items.find(s => now >= Date.parse(s.tradingTime.start) && now < Date.parse(s.tradingTime.end)) || items[0];
+            if (activeSeason) {
+              const rounds = activeSeason.rounds || [];
+              const upcoming = rounds.find(r => Date.parse(r.tradingTime.end) > now);
+              const finished = rounds.filter(r => Date.parse(r.tradingTime.end) <= now - 45000).slice(-1)[0];
+
+              if (upcoming) {
+                const resEv = await fetch(`${BASE}/api/sportsbook/virtual/v3/events/list/by-round/${upcoming.id}`, { headers: HEADERS });
+                const evData = await resEv.json();
+                const eng = (evData.responses || []).filter(e => e.competition?.id === '7794');
+                const matches = eng.map((ev, idx) => {
+                  const parts = (ev.name || '').split(' - ');
+                  const odds = parseBetPawaRawMarkets(ev);
+                  return { slot: idx + 1, home: parts[0]?.trim(), away: parts[1]?.trim(), odds, score: null };
+                });
+                const pricedCount = matches.filter(m => m.odds.over_1_5 && m.odds.under_2_5 && m.odds.gg).length;
+                roundsOut.push({
+                  bookmaker: 'betpawa',
+                  provider_round_id: String(upcoming.id),
+                  week: String(upcoming.name),
+                  round_status: 'TRADING',
+                  kickoff_utc: upcoming.tradingTime.end,
+                  priced_matches_count: pricedCount,
+                  scored_matches_count: 0,
+                  matches
+                });
+              }
+
+              if (finished) {
+                const resFin = await fetch(`${BASE}/api/sportsbook/virtual/v3/events/list/by-round/${finished.id}`, { headers: HEADERS });
+                const finData = await resFin.json();
+                const engFin = (finData.responses || []).filter(e => e.competition?.id === '7794');
+                const matches = engFin.map((ev, idx) => {
+                  const parts = (ev.name || '').split(' - ');
+                  return { slot: idx + 1, home: parts[0]?.trim(), away: parts[1]?.trim(), odds: null, score: parseSettledScore(ev) };
+                });
+                const scoredCount = matches.filter(m => !!m.score).length;
+                roundsOut.push({
+                  bookmaker: 'betpawa',
+                  provider_round_id: String(finished.id),
+                  week: String(finished.name),
+                  round_status: 'RESOLVED',
+                  kickoff_utc: finished.tradingTime.end,
+                  priced_matches_count: 0,
+                  scored_matches_count: scoredCount,
+                  matches
+                });
+              }
+            }
+            return { rounds: roundsOut, durationMs: Math.round(performance.now() - t0) };
+          }
+
+          async function collectVirtusTecRounds() {
+            const t0 = performance.now();
+            const WS_URL = 'wss://virtual-proxy.virtustec.com/vs';
+            return new Promise((resolve, reject) => {
+              let xs = 0;
+              let clientId = null;
+              let calcId = 540031;
+              let gotUpcoming = false;
+              let gotResolved = false;
+              const roundsOut = [];
+
+              const timeout = setTimeout(() => {
+                try { ws.close(); } catch (e) {}
+                reject(new Error('VirtusTec collection timeout'));
+              }, 15000);
+
+              const ws = new WebSocket(WS_URL);
+              function sendReq(resource, query = {}) {
+                ws.send(JSON.stringify({
+                  type: 'REQUEST',
+                  xs: xs++,
+                  ts: Date.now(),
+                  req: {
+                    method: 'GET',
+                    query,
+                    headers: { 'Content-Type': 'application/json', ...(clientId ? { clientId } : {}) },
+                    resource,
+                    basePath: '/api/client/v0.1',
+                    host: 'wss://virtual-proxy.virtustec.com'
+                  }
+                }));
+              }
+
+              ws.addEventListener('open', () => {
+                sendReq('/session/loginHwId', {
+                  hwId: process.env.VIRTUSTEC_HW_ID,
+                  profiles: 'MOBILE',
+                  tags: 'mobile,v4'
+                });
+              });
+
+              ws.addEventListener('message', (event) => {
+                const data = JSON.parse(typeof event.data === 'string' ? event.data : event.data.toString());
+                if (data.res && data.res.statusCode === 200 && data.res.body && data.res.body.clientId) {
+                  clientId = data.res.body.clientId;
+                  if (data.res.body.calculationId) calcId = data.res.body.calculationId;
+                  const nowSec = Math.floor(Date.now() / 1000);
+                  sendReq('/eventBlocks/find', {
+                    startTime: nowSec - 30,
+                    endTime: nowSec + 1200,
+                    order: 'ASC',
+                    contentType: 'PLAYLIST',
+                    contentId: 41104,
+                    n: 3,
+                    profile: 'MOBILE',
+                    calculationId: calcId
+                  });
+                  sendReq('/eventBlocks/find', {
+                    startTime: 1,
+                    endTime: nowSec,
+                    order: 'DESC',
+                    status: 'RESULT,CANCELLED',
+                    contentType: 'PLAYLIST',
+                    contentId: 41104,
+                    n: 2,
+                    profile: 'MOBILE',
+                    calculationId: calcId
+                  });
+                } else if (data.res && Array.isArray(data.res.body)) {
+                  const blocks = data.res.body;
+                  const isResolved = blocks.length > 0 && blocks.every(b => b.serverStatus === 'RESOLVED');
+                  if (!isResolved && !gotUpcoming) {
+                    gotUpcoming = true;
+                    for (const b of blocks.filter(x => x.serverStatus !== 'RESOLVED').slice(0, 2)) {
+                      const evs = b.events || [];
+                      const matches = evs.map((ev, idx) => {
+                        const o = ev.data?.oddValues || [];
+                        return {
+                          slot: idx + 1,
+                          home: ev.data?.participants?.[0]?.fifaCode,
+                          away: ev.data?.participants?.[1]?.fifaCode,
+                          odds: o.length >= 60 ? {
+                            over_1_5: parseFloat(o[58]),
+                            over_2_5: parseFloat(o[56]),
+                            under_2_5: parseFloat(o[57]),
+                            gg: parseFloat(o[51]),
+                            ng: parseFloat(o[50])
+                          } : null,
+                          score: null
+                        };
+                      });
+                      roundsOut.push({
+                        bookmaker: 'sportybet',
+                        provider_round_id: String(b.eBlockId),
+                        week: String(b.data?.matchDay || ''),
+                        round_status: 'SCHEDULED',
+                        kickoff_utc: b.eventTime,
+                        priced_matches_count: matches.filter(m => m.odds && m.odds.under_2_5).length,
+                        scored_matches_count: 0,
+                        matches
+                      });
+                    }
+                  } else if (isResolved && !gotResolved) {
+                    gotResolved = true;
+                    for (const b of blocks.slice(0, 1)) {
+                      const evs = b.events || [];
+                      const matches = evs.map((ev, idx) => {
+                        let score = null;
+                        if (ev.result?.wonMarkets) {
+                          const m = ev.result.wonMarkets.find(x => /^_\d+_\d+$/.test(x));
+                          if (m) score = m.replace(/^_/, '').replace('_', '-');
+                        }
+                        return {
+                          slot: idx + 1,
+                          home: ev.data?.participants?.[0]?.fifaCode,
+                          away: ev.data?.participants?.[1]?.fifaCode,
+                          odds: null,
+                          score
+                        };
+                      });
+                      roundsOut.push({
+                        bookmaker: 'sportybet',
+                        provider_round_id: String(b.eBlockId),
+                        week: String(b.data?.matchDay || ''),
+                        round_status: 'RESOLVED',
+                        kickoff_utc: b.eventTime,
+                        priced_matches_count: 0,
+                        scored_matches_count: matches.filter(m => !!m.score).length,
+                        matches
+                      });
+                    }
+                  }
+                  if (gotUpcoming && gotResolved) {
+                    clearTimeout(timeout);
+                    try { ws.close(); } catch (e) {}
+                    resolve({ rounds: roundsOut, durationMs: Math.round(performance.now() - t0) });
+                  }
+                }
+              });
+            });
+          }
+
+          let rounds = [];
+          let collectionMetrics = { mode: 'heartbeat_only', totalCollectionMs: 0, betpawaMs: 0, sportybetMs: 0 };
+
+          if (eventType === 'phase0_test5_collect') {
+            const c0 = performance.now();
+            const [bp, sb] = await Promise.all([
+              collectBetPawaRounds(),
+              collectVirtusTecRounds()
+            ]);
+            rounds = [...bp.rounds, ...sb.rounds];
+            collectionMetrics = {
+              mode: 'real_provider_collection',
+              totalCollectionMs: Math.round(performance.now() - c0),
+              betpawaMs: bp.durationMs,
+              sportybetMs: sb.durationMs,
+              roundsCollected: rounds.length
+            };
+          }
+
+          const batchPayload = {
+            batch_id: `batch-${jobId}`,
+            job_id: jobId,
+            event_type: eventType,
+            github_run_id: String(process.env.GITHUB_RUN_ID || ''),
+            dispatched_at_ms: dispatchedAtMs,
+            runner_started_at_ms: runnerStartedAtMs,
+            rounds,
+            summary: {
+              queue_delay_ms: queueDelayMs,
+              ...collectionMetrics
+            }
+          };
+
+          const rawBody = JSON.stringify(batchPayload);
+          const tsSec = Math.floor(Date.now() / 1000);
+          const signature = signPayload(hmacSecret, tsSec, rawBody);
+
+          const cb0 = performance.now();
+          const cbRes = await fetch(callbackUrl, {
+            method: 'POST',
+            headers: {
+              'Content-Type': 'application/json',
+              'X-VF-Timestamp': String(tsSec),
+              'X-VF-Signature': signature
+            },
+            body: rawBody
+          });
+          const callbackLatencyMs = Math.round(performance.now() - cb0);
+          const cbData = await cbRes.json();
+
+          console.log('=== PHASE0_TEST5_RUNNER_METRICS_START ===');
+          console.log(JSON.stringify({
+            job_id: jobId,
+            event_type: eventType,
+            github_run_id: process.env.GITHUB_RUN_ID,
+            queue_delay_ms: queueDelayMs,
+            collection_metrics: collectionMetrics,
+            callback_status: cbRes.status,
+            callback_latency_ms: callbackLatencyMs,
+            worker_ingest_response: cbData
+          }, null, 2));
+          console.log('=== PHASE0_TEST5_RUNNER_METRICS_END ===');
+
+          if (!cbRes.ok) {
+            process.exit(1);
+          }
+          EOF
