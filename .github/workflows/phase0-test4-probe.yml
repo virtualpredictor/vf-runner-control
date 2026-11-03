@@ -1,0 +1,424 @@
+name: Phase 0 Test 4 — Provider Connectivity Probe
+
+on:
+  workflow_dispatch:
+    inputs:
+      dispatched_at_ms:
+        description: "Epoch milliseconds when workflow_dispatch was called"
+        required: true
+        type: string
+      run_label:
+        description: "Label for this probe run"
+        required: false
+        default: "run-1"
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Record runner start time and execute read-only provider probes
+        env:
+          DISPATCHED_AT_MS: ${{ inputs.dispatched_at_ms }}
+          RUN_LABEL: ${{ inputs.run_label }}
+          VIRTUSTEC_HW_ID: ${{ secrets.VIRTUSTEC_HW_ID }}
+        run: |
+          node --input-type=module << 'EOF'
+          import dns from 'node:dns/promises';
+          import crypto from 'node:crypto';
+          import os from 'node:os';
+
+          const runnerStartMs = Date.now();
+          const dispatchedAtMs = Number(process.env.DISPATCHED_AT_MS || 0);
+          const queueAndStartupDelayMs = dispatchedAtMs ? (runnerStartMs - dispatchedAtMs) : null;
+
+          function parseBetPawaRawMarkets(event) {
+            const rawOdds = {
+              over_1_5: null,
+              under_1_5: null,
+              over_2_5: null,
+              under_2_5: null,
+              over_3_5: null,
+              under_3_5: null,
+              gg: null,
+              ng: null
+            };
+            if (!event || !Array.isArray(event.markets)) return rawOdds;
+            for (const m of event.markets) {
+              const mId = String(m.marketType?.id || '');
+              const mName = m.marketType?.name || '';
+              if (mId === '5000' || mName.includes('Total Score Over/Under')) {
+                for (const r of (m.row || [])) {
+                  const total = r.specifier?.total || r.prices?.[0]?.handicap;
+                  const over = (r.prices || []).find(p => p.name?.toLowerCase() === 'over');
+                  const under = (r.prices || []).find(p => p.name?.toLowerCase() === 'under');
+                  if (total === '1.5') {
+                    if (over?.odds) rawOdds.over_1_5 = Number(over.odds);
+                    if (under?.odds) rawOdds.under_1_5 = Number(under.odds);
+                  } else if (total === '2.5') {
+                    if (over?.odds) rawOdds.over_2_5 = Number(over.odds);
+                    if (under?.odds) rawOdds.under_2_5 = Number(under.odds);
+                  } else if (total === '3.5') {
+                    if (over?.odds) rawOdds.over_3_5 = Number(over.odds);
+                    if (under?.odds) rawOdds.under_3_5 = Number(under.odds);
+                  }
+                }
+              } else if (mId === '3795' || mName.includes('Both Teams To Score')) {
+                const yes = m.row?.[0]?.prices?.find(p => p.name?.toLowerCase() === 'yes');
+                const no = m.row?.[0]?.prices?.find(p => p.name?.toLowerCase() === 'no');
+                if (yes?.odds) rawOdds.gg = Number(yes.odds);
+                if (no?.odds) rawOdds.ng = Number(no.odds);
+              }
+            }
+            return rawOdds;
+          }
+
+          function parseSettledScore(event) {
+            const hp = event.results?.participantPeriodResults?.find(p => p.participant?.type === 'HOME');
+            const ap = event.results?.participantPeriodResults?.find(p => p.participant?.type === 'AWAY');
+            const hs = hp?.periodResults?.find(pr => pr.period?.slug === 'FULL_TIME_EXCLUDING_OVERTIME')?.result;
+            const as = ap?.periodResults?.find(pr => pr.period?.slug === 'FULL_TIME_EXCLUDING_OVERTIME')?.result;
+            if (hs !== undefined && as !== undefined && hs !== '' && as !== '') {
+              return `${hs}-${as}`;
+            }
+            return null;
+          }
+
+          async function probeBetPawa() {
+            const BASE = 'https://www.betpawa.ng';
+            const HEADERS = {
+              'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+              'Accept': 'application/json, text/plain, */*',
+              'X-Pawa-Brand': 'betpawa-nigeria',
+              'X-Pawa-Language': 'en'
+            };
+            const report = {
+              dnsResolved: false,
+              dnsLatencyMs: null,
+              connectionSuccessful: false,
+              httpStatus: null,
+              seasonsLatencyMs: null,
+              competition7794Found: false,
+              upcomingRoundsCount: 0,
+              upcomingRoundsWithPricesCount: 0,
+              upcomingRoundsTested: [],
+              settledRoundTested: null,
+              errors: []
+            };
+            try {
+              const td0 = performance.now();
+              await dns.lookup('www.betpawa.ng');
+              report.dnsResolved = true;
+              report.dnsLatencyMs = Math.round(performance.now() - td0);
+
+              const t0 = performance.now();
+              const resSeasons = await fetch(`${BASE}/api/sportsbook/virtual/v2/seasons/list/actual`, { headers: HEADERS });
+              report.seasonsLatencyMs = Math.round(performance.now() - t0);
+              report.httpStatus = resSeasons.status;
+              report.connectionSuccessful = resSeasons.ok;
+              if (!resSeasons.ok) {
+                const errBody = await resSeasons.text();
+                report.errors.push(`HTTP ${resSeasons.status}: ${errBody.slice(0, 200)}`);
+                return report;
+              }
+              const seasonsData = await resSeasons.json();
+              const items = seasonsData.items || [];
+              const now = Date.now();
+              const activeSeason = items.find(s => now >= Date.parse(s.tradingTime.start) && now < Date.parse(s.tradingTime.end)) || items[0];
+              if (!activeSeason) {
+                report.errors.push('No active season returned');
+                return report;
+              }
+              const rounds = activeSeason.rounds || [];
+              const upcomingRounds = rounds.filter(r => Date.parse(r.tradingTime.end) > now);
+              const finishedRounds = rounds.filter(r => Date.parse(r.tradingTime.end) <= now - 45000);
+              report.upcomingRoundsCount = upcomingRounds.length;
+
+              let pricedCount = 0;
+              for (const uRound of upcomingRounds.slice(0, 3)) {
+                const tr0 = performance.now();
+                const resEv = await fetch(`${BASE}/api/sportsbook/virtual/v3/events/list/by-round/${uRound.id}`, { headers: HEADERS });
+                const evMs = Math.round(performance.now() - tr0);
+                const evData = await resEv.json();
+                const allEvents = evData.responses || [];
+                const englishEvents = allEvents.filter(e => e.competition?.id === '7794');
+                if (englishEvents.length > 0) report.competition7794Found = true;
+                const parsed = englishEvents.map((ev, idx) => ({
+                  slot: idx + 1,
+                  name: ev.name,
+                  marketsCount: (ev.markets || []).length,
+                  odds: parseBetPawaRawMarkets(ev)
+                }));
+                const complete = parsed.filter(m => m.odds.over_1_5 && m.odds.over_2_5 && m.odds.under_2_5 && m.odds.gg && m.odds.ng).length;
+                if (complete === 10) pricedCount++;
+                report.upcomingRoundsTested.push({
+                  roundId: uRound.id,
+                  week: uRound.name,
+                  kickoffUtc: uRound.tradingTime.end,
+                  leadTimeSeconds: Math.round((Date.parse(uRound.tradingTime.end) - Date.now()) / 1000),
+                  httpStatus: resEv.status,
+                  latencyMs: evMs,
+                  english7794Events: englishEvents.length,
+                  marketsPerEventCount: englishEvents[0]?.markets?.length || 0,
+                  completeMarketsCount: complete,
+                  sampleMatch: parsed[0] || null
+                });
+              }
+              report.upcomingRoundsWithPricesCount = pricedCount;
+
+              if (finishedRounds.length > 0) {
+                const lastFin = finishedRounds[finishedRounds.length - 1];
+                const tf0 = performance.now();
+                const resFin = await fetch(`${BASE}/api/sportsbook/virtual/v3/events/list/by-round/${lastFin.id}`, { headers: HEADERS });
+                const finMs = Math.round(performance.now() - tf0);
+                const finData = await resFin.json();
+                const engFin = (finData.responses || []).filter(e => e.competition?.id === '7794');
+                const scores = engFin.map((ev, idx) => ({
+                  slot: idx + 1,
+                  name: ev.name,
+                  score: parseSettledScore(ev)
+                }));
+                report.settledRoundTested = {
+                  roundId: lastFin.id,
+                  week: lastFin.name,
+                  httpStatus: resFin.status,
+                  latencyMs: finMs,
+                  english7794Count: engFin.length,
+                  allScored: scores.length === 10 && scores.every(s => !!s.score),
+                  sampleScores: scores.slice(0, 3)
+                };
+              }
+            } catch (err) {
+              report.errors.push(err.message);
+            }
+            return report;
+          }
+
+          async function probeVirtusTec() {
+            const WS_URL = 'wss://virtual-proxy.virtustec.com/vs';
+            const report = {
+              dnsResolved: false,
+              dnsLatencyMs: null,
+              connectionSuccessful: false,
+              handshakeLatencyMs: null,
+              authLatencyMs: null,
+              authStatusCode: null,
+              authSuccessful: false,
+              calculationId: null,
+              upcomingQueryLatencyMs: null,
+              resolvedQueryLatencyMs: null,
+              upcomingBlocksCount: 0,
+              upcomingBlocks: [],
+              resolvedBlocksCount: 0,
+              resolvedBlocksSample: [],
+              errors: []
+            };
+
+            try {
+              const td0 = performance.now();
+              await dns.lookup('virtual-proxy.virtustec.com');
+              report.dnsResolved = true;
+              report.dnsLatencyMs = Math.round(performance.now() - td0);
+            } catch (err) {
+              report.errors.push('DNS error: ' + err.message);
+              return report;
+            }
+
+            return new Promise((resolve) => {
+              const tStart = performance.now();
+              let xs = 0;
+              let clientId = null;
+              let calcId = 540031;
+              let tAuthSent = 0;
+              let tUpcomingSent = 0;
+              let tResolvedSent = 0;
+              let gotUpcoming = false;
+              let gotResolved = false;
+
+              const timeout = setTimeout(() => {
+                report.errors.push('Timed out after 15s waiting for WebSocket responses');
+                try { ws.close(); } catch (e) {}
+                resolve(report);
+              }, 15000);
+
+              const ws = new WebSocket(WS_URL);
+
+              function sendReq(resource, query = {}) {
+                const msg = {
+                  type: 'REQUEST',
+                  xs: xs++,
+                  ts: Date.now(),
+                  req: {
+                    method: 'GET',
+                    query,
+                    headers: {
+                      'Content-Type': 'application/json',
+                      ...(clientId ? { clientId } : {})
+                    },
+                    resource,
+                    basePath: '/api/client/v0.1',
+                    host: 'wss://virtual-proxy.virtustec.com'
+                  }
+                };
+                ws.send(JSON.stringify(msg));
+              }
+
+              ws.addEventListener('open', () => {
+                report.connectionSuccessful = true;
+                report.handshakeLatencyMs = Math.round(performance.now() - tStart);
+                tAuthSent = performance.now();
+                const hwId = process.env.VIRTUSTEC_HW_ID || crypto.randomUUID();
+                sendReq('/session/loginHwId', {
+                  hwId,
+                  profiles: 'MOBILE',
+                  tags: 'mobile,v4'
+                });
+              });
+
+              ws.addEventListener('message', (event) => {
+                try {
+                  const data = JSON.parse(typeof event.data === 'string' ? event.data : event.data.toString());
+                  if (data.res && data.res.statusCode && data.res.body && data.res.body.clientId) {
+                    report.authLatencyMs = Math.round(performance.now() - tAuthSent);
+                    report.authStatusCode = data.res.statusCode;
+                    report.authSuccessful = data.res.statusCode === 200;
+                    clientId = data.res.body.clientId;
+                    if (data.res.body.calculationId) calcId = data.res.body.calculationId;
+                    report.calculationId = calcId;
+
+                    const nowSec = Math.floor(Date.now() / 1000);
+                    tUpcomingSent = performance.now();
+                    sendReq('/eventBlocks/find', {
+                      startTime: nowSec - 30,
+                      endTime: nowSec + 1200,
+                      order: 'ASC',
+                      contentType: 'PLAYLIST',
+                      contentId: 41104,
+                      n: 6,
+                      profile: 'MOBILE',
+                      calculationId: calcId
+                    });
+
+                    tResolvedSent = performance.now();
+                    sendReq('/eventBlocks/find', {
+                      startTime: 1,
+                      endTime: nowSec,
+                      order: 'DESC',
+                      status: 'RESULT,CANCELLED',
+                      contentType: 'PLAYLIST',
+                      contentId: 41104,
+                      n: 6,
+                      profile: 'MOBILE',
+                      calculationId: calcId
+                    });
+                  } else if (data.res && Array.isArray(data.res.body)) {
+                    const blocks = data.res.body;
+                    const isResolved = blocks.length > 0 && blocks.every(b => b.serverStatus === 'RESOLVED');
+                    if (!isResolved && !gotUpcoming) {
+                      gotUpcoming = true;
+                      report.upcomingQueryLatencyMs = Math.round(performance.now() - tUpcomingSent);
+                      const scheduled = blocks.filter(b => b.serverStatus !== 'RESOLVED');
+                      report.upcomingBlocksCount = scheduled.length;
+                      report.upcomingBlocks = scheduled.map(b => {
+                        const evs = b.events || [];
+                        const firstEv = evs[0] || {};
+                        const oddValues = firstEv.data?.oddValues || [];
+                        return {
+                          eBlockId: b.eBlockId,
+                          serverStatus: b.serverStatus,
+                          matchDay: b.data?.matchDay,
+                          eventTimeUtc: b.eventTime,
+                          leadTimeSeconds: Math.round((Date.parse(b.eventTime) - Date.now()) / 1000),
+                          eventsCount: evs.length,
+                          oddValuesLength: oddValues.length,
+                          allEventsHaveRealOddValues: evs.every(ev => Array.isArray(ev.data?.oddValues) && ev.data.oddValues.length >= 60),
+                          sampleMatch: firstEv.data ? {
+                            home: firstEv.data.participants?.[0]?.fifaCode,
+                            away: firstEv.data.participants?.[1]?.fifaCode,
+                            odds: oddValues.length >= 60 ? {
+                              over_1_5: parseFloat(oddValues[58]),
+                              over_2_5: parseFloat(oddValues[56]),
+                              under_2_5: parseFloat(oddValues[57]),
+                              gg: parseFloat(oddValues[51]),
+                              ng: parseFloat(oddValues[50])
+                            } : null
+                          } : null
+                        };
+                      });
+                    } else if (isResolved && !gotResolved) {
+                      gotResolved = true;
+                      report.resolvedQueryLatencyMs = Math.round(performance.now() - tResolvedSent);
+                      report.resolvedBlocksCount = blocks.length;
+                      report.resolvedBlocksSample = blocks.slice(0, 2).map(b => {
+                        const evs = b.events || [];
+                        const scored = evs.map((ev, idx) => {
+                          const home = ev.data?.participants?.[0]?.fifaCode;
+                          const away = ev.data?.participants?.[1]?.fifaCode;
+                          let score = null;
+                          if (ev.result?.wonMarkets) {
+                            const m = ev.result.wonMarkets.find(x => /^_\d+_\d+$/.test(x));
+                            if (m) score = m.replace(/^_/, '').replace('_', '-');
+                          }
+                          return { slot: idx + 1, home, away, score };
+                        });
+                        return {
+                          eBlockId: b.eBlockId,
+                          matchDay: b.data?.matchDay,
+                          eventTimeUtc: b.eventTime,
+                          eventsCount: evs.length,
+                          allScored: scored.every(s => !!s.score),
+                          sampleScores: scored.slice(0, 3)
+                        };
+                      });
+                    }
+                    if (gotUpcoming && gotResolved) {
+                      clearTimeout(timeout);
+                      try { ws.close(); } catch (e) {}
+                      resolve(report);
+                    }
+                  }
+                } catch (err) {
+                  report.errors.push(err.message);
+                }
+              });
+
+              ws.addEventListener('error', (err) => {
+                report.errors.push(err.message || 'WebSocket error');
+              });
+            });
+          }
+
+          const [betpawa, sportybet] = await Promise.all([
+            probeBetPawa(),
+            probeVirtusTec()
+          ]);
+
+          const probeCompletedMs = Date.now();
+          const output = {
+            runLabel: process.env.RUN_LABEL || 'run-1',
+            runnerEnvironment: {
+              platform: os.platform(),
+              arch: os.arch(),
+              release: os.release(),
+              nodeVersion: process.version
+            },
+            timing: {
+              dispatchedAtUtc: dispatchedAtMs ? new Date(dispatchedAtMs).toISOString() : null,
+              runnerStartedAtUtc: new Date(runnerStartMs).toISOString(),
+              probeCompletedAtUtc: new Date(probeCompletedMs).toISOString(),
+              queueAndStartupDelayMs,
+              probeExecutionDurationMs: probeCompletedMs - runnerStartMs,
+              totalEndToEndMs: dispatchedAtMs ? (probeCompletedMs - dispatchedAtMs) : null
+            },
+            betpawa,
+            sportybet
+          };
+
+          console.log('=== PHASE0_TEST4_JSON_START ===');
+          console.log(JSON.stringify(output, null, 2));
+          console.log('=== PHASE0_TEST4_JSON_END ===');
+          EOF
