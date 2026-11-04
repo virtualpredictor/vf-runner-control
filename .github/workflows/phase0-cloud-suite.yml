@@ -1,0 +1,165 @@
+name: Phase 0 Cloud Suite
+
+# One run, one runner: Test A (browser correctness against a local server on the runner) and Test B (integrated
+# staging run through the Cloudflare staging Worker + R2 snapshot) execute back to back on the same GitHub-hosted VM.
+# Manual dispatch only. No pull_request or push triggers, so untrusted code can never reach the secrets below.
+# The application source lives in the private vf-core repository and is fetched read-only at one pinned commit.
+# Logs and artifacts carry sanitized metrics and synthetic page text only.
+
+on:
+  workflow_dispatch:
+    inputs:
+      core_sha:
+        description: "Pinned vf-core commit (full 40-char SHA)"
+        required: true
+        type: string
+      dispatched_at_ms:
+        description: "Epoch milliseconds when the run was dispatched (runner startup measurement)"
+        required: true
+        type: string
+      a_minutes:
+        description: "Test A duration in minutes"
+        required: false
+        default: "60"
+        type: string
+      b_minutes:
+        description: "Test B duration in minutes"
+        required: false
+        default: "90"
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: phase0-cloud-suite
+  cancel-in-progress: false
+
+jobs:
+  suite:
+    runs-on: ubuntu-latest
+    timeout-minutes: 330
+    env:
+      CORE_SHA: ${{ inputs.core_sha }}
+      A_MINUTES: ${{ inputs.a_minutes }}
+      B_MINUTES: ${{ inputs.b_minutes }}
+      APP_URL: https://vf-phase0-app-staging.virtualpredictor.workers.dev
+      SNAPSHOT_URL: https://pub-3ddeb4280145459d9e18b30b357e4403.r2.dev/snapshot.json
+      LOCAL_BASE: http://localhost:8787
+      OUT_DIR: ${{ github.workspace }}/out
+    steps:
+      - name: Record runner start
+        env:
+          DISPATCHED_AT_MS: ${{ inputs.dispatched_at_ms }}
+        run: |
+          mkdir -p "$OUT_DIR"
+          START_MS=$(date +%s%3N)
+          echo "SUITE_START_MS=$START_MS" >> "$GITHUB_ENV"
+          echo "RUN_ID=$(date -u +%Y%m%dT%H%M%SZ)-${{ github.run_id }}" >> "$GITHUB_ENV"
+          node -e "console.log(JSON.stringify({runner_start_delay_ms: Number(process.argv[1]) - Number(process.argv[2]), runner_image: process.env.ImageVersion||null, runner_os: process.env.RUNNER_OS}))" "$START_MS" "$DISPATCHED_AT_MS" | tee "$OUT_DIR/suite_startup.json"
+
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020  # v4.4.0
+        with:
+          node-version: "22"
+
+      - name: Fetch private source at the pinned commit (read-only deploy key)
+        env:
+          VF_CORE_DEPLOY_KEY: ${{ secrets.VF_CORE_DEPLOY_KEY }}
+        run: |
+          set +x
+          case "$CORE_SHA" in *[!0-9a-f]*|"") echo "core_sha must be a 40-char hex SHA"; exit 1;; esac
+          [ "${#CORE_SHA}" -eq 40 ] || { echo "core_sha must be 40 chars"; exit 1; }
+          umask 077
+          mkdir -p "$HOME/.ssh"
+          printf '%s\n' "$VF_CORE_DEPLOY_KEY" > "$HOME/.ssh/vf_core"
+          ssh-keyscan -t ed25519,rsa github.com >> "$HOME/.ssh/known_hosts" 2>/dev/null
+          export GIT_SSH_COMMAND="ssh -i $HOME/.ssh/vf_core -o IdentitiesOnly=yes"
+          git clone --quiet --no-checkout git@github.com:virtualpredictor/vf-core.git core
+          cd core
+          git checkout --quiet "$CORE_SHA"
+          [ "$(git rev-parse HEAD)" = "$CORE_SHA" ] || { echo "pinned commit mismatch"; exit 1; }
+          rm -rf .git
+          rm -f "$HOME/.ssh/vf_core"
+          echo "source fetched at $CORE_SHA ($(find . -type f | wc -l) files)"
+
+      - name: Install Playwright and headless Chromium
+        run: |
+          set -euo pipefail
+          mkdir -p pw && cd pw
+          npm init -y >/dev/null
+          npm install --silent playwright@1.49.1
+          npx playwright install --with-deps chromium >/dev/null
+          echo "NODE_PATH=$PWD/node_modules" >> "$GITHUB_ENV"
+
+      - name: Start the application server on the runner
+        working-directory: core
+        run: |
+          set -euo pipefail
+          nohup node server.js > "$RUNNER_TEMP/server.log" 2>&1 &
+          echo $! > "$RUNNER_TEMP/server.pid"
+          for i in $(seq 1 60); do
+            if curl -fsS -H "cookie: wv_session=wv_permanent_demo_token" "$LOCAL_BASE/api/round?bookmaker=sportybet" >/dev/null 2>&1; then echo "server up after ${i}s"; break; fi
+            sleep 1
+          done
+          curl -fsS -H "cookie: wv_session=wv_permanent_demo_token" "$LOCAL_BASE/api/round?bookmaker=sportybet" >/dev/null
+
+      - name: Test A - browser correctness (local server, headless Chromium)
+        id: test_a
+        continue-on-error: true
+        working-directory: core/ci
+        env:
+          A_MINUTES: ${{ inputs.a_minutes }}
+        run: |
+          date +%s%3N > "$OUT_DIR/testA_started_ms"
+          node test_a_history_60min.js
+          date +%s%3N > "$OUT_DIR/testA_finished_ms"
+
+      - name: Check staging Worker
+        run: |
+          set -euo pipefail
+          curl -fsS "$APP_URL/_health" | head -c 300; echo
+
+      - name: Test B - integrated staging run (publisher + browsers)
+        id: test_b
+        continue-on-error: true
+        working-directory: core/ci
+        env:
+          PUBLISH_KEY: ${{ secrets.VF_STAGING_PUBLISH_KEY }}
+          B_MINUTES: ${{ inputs.b_minutes }}
+        run: |
+          set +e; set -u
+          date +%s%3N > "$OUT_DIR/testB_started_ms"
+          PUBLISH_MINUTES=$(( B_MINUTES + 6 )) PUBLISH_LOG="$OUT_DIR/publish_${RUN_ID}_log.jsonl" PUBLISH_INTERVAL_S=60 node publish_snapshot.js &
+          PUB=$!
+          sleep 20
+          node test_b_staging.js
+          RC=$?
+          kill "$PUB" 2>/dev/null || true
+          date +%s%3N > "$OUT_DIR/testB_finished_ms"
+          exit $RC
+
+      - name: Sanitized summary
+        if: always()
+        run: |
+          node core/ci/summarize.js "$OUT_DIR" >> "$GITHUB_STEP_SUMMARY" || true
+          echo "server error lines: $(grep -ci error "$RUNNER_TEMP/server.log" 2>/dev/null || echo 0)" >> "$OUT_DIR/server_error_count.txt"
+          echo "total_suite_seconds=$(( ($(date +%s%3N) - SUITE_START_MS) / 1000 ))" | tee "$OUT_DIR/suite_total.txt"
+
+      - name: Upload evidence (no secrets, no source)
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4.6.2
+        with:
+          name: phase0-evidence-${{ github.run_id }}
+          path: out/
+          if-no-files-found: warn
+          retention-days: 90
+
+      - name: Fail the run if either test failed
+        if: always()
+        run: |
+          echo "test_a=${{ steps.test_a.outcome }} test_b=${{ steps.test_b.outcome }}"
+          [ "${{ steps.test_a.outcome }}" = "success" ] && [ "${{ steps.test_b.outcome }}" = "success" ]
