@@ -1,10 +1,15 @@
 name: Phase 0 Cloud Suite
 
-# One run, one runner: Test A (browser correctness against a local server on the runner) and Test B (integrated
-# staging run through the Cloudflare staging Worker + R2 snapshot) execute back to back on the same GitHub-hosted VM.
-# Manual dispatch only. No pull_request or push triggers, so untrusted code can never reach the secrets below.
-# The application source lives in the private vf-core repository and is fetched read-only at one pinned commit.
-# Logs and artifacts carry sanitized metrics and synthetic page text only.
+# Manual dispatch only: no pull_request, pull_request_target or push triggers, so untrusted code can never reach the
+# secrets below. Only the repository owner can dispatch it.
+#
+# mode=smoke  private-source checkout check only (one short job). Nothing else runs.
+# mode=full   the same checkout check, then (only if it passed) Test A and Test B back to back on one runner.
+#             Both tests use real provider data only: if a provider is unreachable the run reports the source failure
+#             and stops, and no synthetic data is ever counted as a provider test.
+#
+# The application source is in the private vf-core repository and is fetched read-only at one pinned commit with a
+# deploy key. It is never printed, never uploaded as an artifact and never copied into this public repository.
 
 on:
   workflow_dispatch:
@@ -17,13 +22,19 @@ on:
         description: "Epoch milliseconds when the run was dispatched (runner startup measurement)"
         required: true
         type: string
+      mode:
+        description: "smoke = checkout check only, full = checkout check + Test A + Test B"
+        required: false
+        default: "smoke"
+        type: choice
+        options: [smoke, full]
       a_minutes:
-        description: "Test A duration in minutes"
+        description: "Test A duration in minutes (full mode)"
         required: false
         default: "60"
         type: string
       b_minutes:
-        description: "Test B duration in minutes"
+        description: "Test B duration in minutes (full mode)"
         required: false
         default: "90"
         type: string
@@ -36,7 +47,57 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  checkout-smoke:
+    if: github.event_name == 'workflow_dispatch' && github.actor == 'virtualpredictor'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      CORE_SHA: ${{ inputs.core_sha }}
+    steps:
+      - name: Validate the pinned commit input
+        run: |
+          set -euo pipefail
+          printf '%s' "$CORE_SHA" | grep -Eq '^[0-9a-f]{40}$' || { echo "core_sha must be a full 40-char lowercase hex SHA"; exit 1; }
+
+      - name: Private-source checkout (read-only deploy key)
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
+        with:
+          repository: virtualpredictor/vf-core
+          ref: ${{ inputs.core_sha }}
+          ssh-key: ${{ secrets.VF_CORE_DEPLOY_KEY }}
+          path: vf-core
+          persist-credentials: false
+
+      - name: Verify commit, privacy and checkout result (sanitized)
+        run: |
+          set -euo pipefail
+          GOT="$(git -C vf-core rev-parse HEAD)"
+          [ "$GOT" = "$CORE_SHA" ] || { echo "FAIL: checked out $GOT, expected $CORE_SHA"; exit 1; }
+          # Privacy: an anonymous request must not be able to see the repository (GitHub answers 404 for private repos)
+          ANON="$(curl -s -o /dev/null -w '%{http_code}' https://github.com/virtualpredictor/vf-core)"
+          API="$(curl -s -o /dev/null -w '%{http_code}' https://api.github.com/repos/virtualpredictor/vf-core)"
+          FILES="$(git -C vf-core ls-files | wc -l)"
+          {
+            echo "## Private-source checkout smoke test"
+            echo ""
+            echo "| check | result |"
+            echo "|---|---|"
+            echo "| checkout step | success |"
+            echo "| commit SHA | \`$GOT\` |"
+            echo "| matches pinned input | yes |"
+            echo "| tracked files (count only) | $FILES |"
+            echo "| anonymous web request | HTTP $ANON (404 = private) |"
+            echo "| anonymous API request | HTTP $API (404 = private) |"
+          } | tee -a "$GITHUB_STEP_SUMMARY"
+          [ "$ANON" = "404" ] && [ "$API" = "404" ] || { echo "FAIL: repository is reachable anonymously"; exit 1; }
+
+      - name: Remove the private checkout from the runner
+        if: always()
+        run: rm -rf vf-core
+
   suite:
+    if: inputs.mode == 'full'
+    needs: checkout-smoke
     runs-on: ubuntu-latest
     timeout-minutes: 330
     env:
@@ -58,35 +119,25 @@ jobs:
           echo "RUN_ID=$(date -u +%Y%m%dT%H%M%SZ)-${{ github.run_id }}" >> "$GITHUB_ENV"
           node -e "console.log(JSON.stringify({runner_start_delay_ms: Number(process.argv[1]) - Number(process.argv[2]), runner_image: process.env.ImageVersion||null, runner_os: process.env.RUNNER_OS}))" "$START_MS" "$DISPATCHED_AT_MS" | tee "$OUT_DIR/suite_startup.json"
 
-      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
-        with:
-          persist-credentials: false
-
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020  # v4.4.0
         with:
           node-version: "22"
 
-      - name: Fetch private source at the pinned commit (read-only deploy key)
-        env:
-          VF_CORE_DEPLOY_KEY: ${{ secrets.VF_CORE_DEPLOY_KEY }}
+      - name: Private-source checkout (read-only deploy key)
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
+        with:
+          repository: virtualpredictor/vf-core
+          ref: ${{ inputs.core_sha }}
+          ssh-key: ${{ secrets.VF_CORE_DEPLOY_KEY }}
+          path: vf-core
+          persist-credentials: false
+
+      - name: Verify the pinned commit and drop git metadata
         run: |
-          set +x
-          case "$CORE_SHA" in *[!0-9a-f]*|"") echo "core_sha must be a 40-char hex SHA"; exit 1;; esac
-          [ "${#CORE_SHA}" -eq 40 ] || { echo "core_sha must be 40 chars"; exit 1; }
-          umask 077
-          mkdir -p "$HOME/.ssh"
-          printf '%s\n' "$VF_CORE_DEPLOY_KEY" > "$HOME/.ssh/vf_core"
-          ssh-keyscan -t ed25519,rsa github.com >> "$HOME/.ssh/known_hosts" 2>/dev/null
-          echo "key fingerprint: $(ssh-keygen -y -f $HOME/.ssh/vf_core 2>&1 | ssh-keygen -lf - 2>&1)"; wc -l < $HOME/.ssh/vf_core
-          export GIT_SSH_COMMAND="ssh -i $HOME/.ssh/vf_core -o IdentitiesOnly=yes"
-          ssh -i $HOME/.ssh/vf_core -o IdentitiesOnly=yes -vvT git@github.com 2>&1 | grep -E "sign|userauth|Sending|denied|identity|key type|accepts|publickey|Load|error" | head -30 || true
-          git clone --quiet --no-checkout git@github.com:virtualpredictor/vf-core.git core
-          cd core
-          git checkout --quiet "$CORE_SHA"
-          [ "$(git rev-parse HEAD)" = "$CORE_SHA" ] || { echo "pinned commit mismatch"; exit 1; }
-          rm -rf .git
-          rm -f "$HOME/.ssh/vf_core"
-          echo "source fetched at $CORE_SHA ($(find . -type f | wc -l) files)"
+          set -euo pipefail
+          [ "$(git -C vf-core rev-parse HEAD)" = "$CORE_SHA" ] || { echo "pinned commit mismatch"; exit 1; }
+          rm -rf vf-core/.git
+          echo "source ready at $CORE_SHA"
 
       - name: Install Playwright and headless Chromium
         run: |
@@ -97,24 +148,28 @@ jobs:
           npx playwright install --with-deps chromium >/dev/null
           echo "NODE_PATH=$PWD/node_modules" >> "$GITHUB_ENV"
 
-      - name: Start the application server on the runner
-        working-directory: core
+      - name: Start the application server in real-data-only mode
+        working-directory: vf-core
+        env:
+          VF_REAL_DATA_ONLY: "1"
+          VIRTUSTEC_HW_ID: ${{ secrets.VIRTUSTEC_HW_ID }}
         run: |
           set -euo pipefail
           nohup node server.js > "$RUNNER_TEMP/server.log" 2>&1 &
           echo $! > "$RUNNER_TEMP/server.pid"
           for i in $(seq 1 60); do
-            if curl -fsS -H "cookie: wv_session=wv_permanent_demo_token" "$LOCAL_BASE/api/round?bookmaker=sportybet" >/dev/null 2>&1; then echo "server up after ${i}s"; break; fi
+            if curl -s -o /dev/null -H "cookie: wv_session=wv_permanent_demo_token" "$LOCAL_BASE/api/round?bookmaker=sportybet"; then echo "server up after ${i}s"; break; fi
             sleep 1
           done
-          curl -fsS -H "cookie: wv_session=wv_permanent_demo_token" "$LOCAL_BASE/api/round?bookmaker=sportybet" >/dev/null
+
+      - name: Source preflight (real provider data only; stops the suite if unavailable)
+        working-directory: vf-core/ci
+        run: node source_preflight.js
 
       - name: Test A - browser correctness (local server, headless Chromium)
         id: test_a
         continue-on-error: true
-        working-directory: core/ci
-        env:
-          A_MINUTES: ${{ inputs.a_minutes }}
+        working-directory: vf-core/ci
         run: |
           date +%s%3N > "$OUT_DIR/testA_started_ms"
           node test_a_history_60min.js
@@ -128,10 +183,9 @@ jobs:
       - name: Test B - integrated staging run (publisher + browsers)
         id: test_b
         continue-on-error: true
-        working-directory: core/ci
+        working-directory: vf-core/ci
         env:
           PUBLISH_KEY: ${{ secrets.VF_STAGING_PUBLISH_KEY }}
-          B_MINUTES: ${{ inputs.b_minutes }}
         run: |
           set +e; set -u
           date +%s%3N > "$OUT_DIR/testB_started_ms"
@@ -147,11 +201,11 @@ jobs:
       - name: Sanitized summary
         if: always()
         run: |
-          node core/ci/summarize.js "$OUT_DIR" >> "$GITHUB_STEP_SUMMARY" || true
+          node vf-core/ci/summarize.js "$OUT_DIR" >> "$GITHUB_STEP_SUMMARY" || true
           echo "server error lines: $(grep -ci error "$RUNNER_TEMP/server.log" 2>/dev/null || echo 0)" >> "$OUT_DIR/server_error_count.txt"
           echo "total_suite_seconds=$(( ($(date +%s%3N) - SUITE_START_MS) / 1000 ))" | tee "$OUT_DIR/suite_total.txt"
 
-      - name: Upload evidence (no secrets, no source)
+      - name: Upload evidence (metrics and logs only; no secrets, no source)
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4.6.2
         with:
