@@ -60,7 +60,9 @@ jobs:
           set -euo pipefail
           printf '%s' "$CORE_SHA" | grep -Eq '^[0-9a-f]{40}$' || { echo "core_sha must be a full 40-char lowercase hex SHA"; exit 1; }
 
-      - name: Private-source checkout (read-only deploy key)
+      - name: Private-source checkout (read-only deploy key), attempt 1
+        id: co1
+        continue-on-error: true
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
         with:
           repository: virtualpredictor/vf-core
@@ -68,6 +70,43 @@ jobs:
           ssh-key: ${{ secrets.VF_CORE_DEPLOY_KEY }}
           path: vf-core
           persist-credentials: false
+
+      - name: Pause before retry
+        if: steps.co1.outcome == 'failure'
+        run: sleep 25
+
+      - name: Private-source checkout, attempt 2
+        id: co2
+        if: steps.co1.outcome == 'failure'
+        continue-on-error: true
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
+        with:
+          repository: virtualpredictor/vf-core
+          ref: ${{ inputs.core_sha }}
+          ssh-key: ${{ secrets.VF_CORE_DEPLOY_KEY }}
+          path: vf-core
+          persist-credentials: false
+
+      - name: Pause before retry
+        if: steps.co1.outcome == 'failure' && steps.co2.outcome == 'failure'
+        run: sleep 25
+
+      - name: Private-source checkout, attempt 3
+        id: co3
+        if: steps.co1.outcome == 'failure' && steps.co2.outcome == 'failure'
+        continue-on-error: true
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
+        with:
+          repository: virtualpredictor/vf-core
+          ref: ${{ inputs.core_sha }}
+          ssh-key: ${{ secrets.VF_CORE_DEPLOY_KEY }}
+          path: vf-core
+          persist-credentials: false
+
+      - name: Require a successful checkout
+        run: |
+          echo "attempts: 1=${{ steps.co1.outcome }} 2=${{ steps.co2.outcome }} 3=${{ steps.co3.outcome }}"
+          [ "${{ steps.co1.outcome }}" = "success" ] || [ "${{ steps.co2.outcome }}" = "success" ] || [ "${{ steps.co3.outcome }}" = "success" ]
 
       - name: Verify commit, privacy and checkout result (sanitized)
         run: |
@@ -124,7 +163,9 @@ jobs:
         with:
           node-version: "22"
 
-      - name: Private-source checkout (read-only deploy key)
+      - name: Private-source checkout (read-only deploy key), attempt 1
+        id: co1
+        continue-on-error: true
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
         with:
           repository: virtualpredictor/vf-core
@@ -132,6 +173,43 @@ jobs:
           ssh-key: ${{ secrets.VF_CORE_DEPLOY_KEY }}
           path: vf-core
           persist-credentials: false
+
+      - name: Pause before retry
+        if: steps.co1.outcome == 'failure'
+        run: sleep 25
+
+      - name: Private-source checkout, attempt 2
+        id: co2
+        if: steps.co1.outcome == 'failure'
+        continue-on-error: true
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
+        with:
+          repository: virtualpredictor/vf-core
+          ref: ${{ inputs.core_sha }}
+          ssh-key: ${{ secrets.VF_CORE_DEPLOY_KEY }}
+          path: vf-core
+          persist-credentials: false
+
+      - name: Pause before retry
+        if: steps.co1.outcome == 'failure' && steps.co2.outcome == 'failure'
+        run: sleep 25
+
+      - name: Private-source checkout, attempt 3
+        id: co3
+        if: steps.co1.outcome == 'failure' && steps.co2.outcome == 'failure'
+        continue-on-error: true
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
+        with:
+          repository: virtualpredictor/vf-core
+          ref: ${{ inputs.core_sha }}
+          ssh-key: ${{ secrets.VF_CORE_DEPLOY_KEY }}
+          path: vf-core
+          persist-credentials: false
+
+      - name: Require a successful checkout
+        run: |
+          echo "attempts: 1=${{ steps.co1.outcome }} 2=${{ steps.co2.outcome }} 3=${{ steps.co3.outcome }}"
+          [ "${{ steps.co1.outcome }}" = "success" ] || [ "${{ steps.co2.outcome }}" = "success" ] || [ "${{ steps.co3.outcome }}" = "success" ]
 
       - name: Verify the pinned commit and drop git metadata
         run: |
