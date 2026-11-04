@@ -4,6 +4,7 @@ name: Phase 0 Cloud Suite
 # secrets below. Only the repository owner can dispatch it.
 #
 # mode=smoke  private-source checkout check only (one short job). Nothing else runs.
+# mode=preflight  checkout + real-provider source check only (about 5 minutes); no tests run.
 # mode=full   the same checkout check, then (only if it passed) Test A and Test B back to back on one runner.
 #             Both tests use real provider data only: if a provider is unreachable the run reports the source failure
 #             and stops, and no synthetic data is ever counted as a provider test.
@@ -23,11 +24,11 @@ on:
         required: true
         type: string
       mode:
-        description: "smoke = checkout check only, full = checkout check + Test A + Test B"
+        description: "smoke = checkout check only, preflight = checkout + real-provider source check, full = everything"
         required: false
         default: "smoke"
         type: choice
-        options: [smoke, full]
+        options: [smoke, preflight, full]
       a_minutes:
         description: "Test A duration in minutes (full mode)"
         required: false
@@ -96,7 +97,7 @@ jobs:
         run: rm -rf vf-core
 
   suite:
-    if: inputs.mode == 'full'
+    if: inputs.mode == 'full' || inputs.mode == 'preflight'
     needs: checkout-smoke
     runs-on: ubuntu-latest
     timeout-minutes: 330
@@ -168,6 +169,7 @@ jobs:
 
       - name: Test A - browser correctness (local server, headless Chromium)
         id: test_a
+        if: inputs.mode == 'full'
         continue-on-error: true
         working-directory: vf-core/ci
         run: |
@@ -176,12 +178,14 @@ jobs:
           date +%s%3N > "$OUT_DIR/testA_finished_ms"
 
       - name: Check staging Worker
+        if: inputs.mode == 'full'
         run: |
           set -euo pipefail
           curl -fsS "$APP_URL/_health" | head -c 300; echo
 
       - name: Test B - integrated staging run (publisher + browsers)
         id: test_b
+        if: inputs.mode == 'full'
         continue-on-error: true
         working-directory: vf-core/ci
         env:
@@ -215,7 +219,7 @@ jobs:
           retention-days: 90
 
       - name: Fail the run if either test failed
-        if: always()
+        if: always() && inputs.mode == 'full'
         run: |
           echo "test_a=${{ steps.test_a.outcome }} test_b=${{ steps.test_b.outcome }}"
           [ "${{ steps.test_a.outcome }}" = "success" ] && [ "${{ steps.test_b.outcome }}" = "success" ]
