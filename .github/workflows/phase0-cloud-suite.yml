@@ -328,6 +328,13 @@ jobs:
           if-no-files-found: ignore
           retention-days: 90
 
+      - name: Cleanup - revoke the public snapshot objects (does not need any Cloudflare login)
+        if: always() && inputs.mode == 'full'
+        working-directory: vf-core/ci
+        env:
+          PUBLISH_KEY: ${{ secrets.VF_STAGING_PUBLISH_KEY }}
+        run: node revoke.js | tee "$OUT_DIR/cleanup_revoke.json"
+
       - name: Sanitized summary
         if: always()
         run: |
