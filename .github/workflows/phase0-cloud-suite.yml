@@ -145,8 +145,9 @@ jobs:
       A_MINUTES: ${{ inputs.a_minutes }}
       B_MINUTES: ${{ inputs.b_minutes }}
       APP_URL: https://vf-phase0-app-staging.virtualpredictor.workers.dev
-      SNAPSHOT_URL: https://pub-3ddeb4280145459d9e18b30b357e4403.r2.dev/snapshot.json
       LOCAL_BASE: http://localhost:8787
+      SNAPSHOT_BASE: https://pub-3ddeb4280145459d9e18b30b357e4403.r2.dev/v1/
+      CONTROL_DIR: ${{ github.workspace }}/control
       OUT_DIR: ${{ github.workspace }}/out
     steps:
       - name: Record runner start
@@ -245,6 +246,28 @@ jobs:
         working-directory: vf-core/ci
         run: node source_preflight.js
 
+      - name: Field-level inspection gate (nothing is published unless this passes)
+        id: inspect
+        continue-on-error: true
+        working-directory: vf-core/ci
+        env:
+          VIRTUSTEC_HW_ID: ${{ secrets.VIRTUSTEC_HW_ID }}
+          PUBLISH_KEY: ${{ secrets.VF_STAGING_PUBLISH_KEY }}
+          INGEST_HMAC_SECRET: ${{ secrets.INGEST_HMAC_SECRET }}
+        run: node inspect_snapshot.js
+
+      - name: Upload checkpoint artifact (stage 1; metrics only)
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4.6.2
+        with:
+          name: phase0-stage1-preflight-inspection-${{ github.run_id }}
+          path: |
+            out/source_preflight.json
+            out/field_inspection.json
+            out/suite_startup.json
+          if-no-files-found: ignore
+          retention-days: 90
+
       - name: Test A - browser correctness (local server, headless Chromium)
         id: test_a
         if: inputs.mode == 'full'
@@ -255,15 +278,26 @@ jobs:
           node test_a_history_60min.js
           date +%s%3N > "$OUT_DIR/testA_finished_ms"
 
+      - name: Upload checkpoint artifact (Test A; metrics only)
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4.6.2
+        with:
+          name: phase0-stage2-testA-${{ github.run_id }}
+          path: |
+            out/testA_*
+            out/testA*_ms
+          if-no-files-found: ignore
+          retention-days: 90
+
       - name: Check staging Worker
-        if: inputs.mode == 'full'
+        if: inputs.mode == 'full' && steps.inspect.outcome == 'success'
         run: |
           set -euo pipefail
           curl -fsS "$APP_URL/_health" | head -c 300; echo
 
       - name: Test B - integrated staging run (publisher + browsers)
         id: test_b
-        if: inputs.mode == 'full'
+        if: inputs.mode == 'full' && steps.inspect.outcome == 'success'
         continue-on-error: true
         working-directory: vf-core/ci
         env:
@@ -271,7 +305,9 @@ jobs:
         run: |
           set +e; set -u
           date +%s%3N > "$OUT_DIR/testB_started_ms"
-          PUBLISH_MINUTES=$(( B_MINUTES + 6 )) PUBLISH_LOG="$OUT_DIR/publish_${RUN_ID}_log.jsonl" PUBLISH_INTERVAL_S=60 node publish_snapshot.js &
+          mkdir -p "$CONTROL_DIR"
+          export PUBLISH_LOG="$OUT_DIR/publish_${RUN_ID}_log.jsonl"
+          PUBLISH_MINUTES=$(( B_MINUTES + 6 )) PUBLISH_INTERVAL_S=20 node publish_snapshot.js &
           PUB=$!
           sleep 20
           node test_b_staging.js
@@ -279,6 +315,18 @@ jobs:
           kill "$PUB" 2>/dev/null || true
           date +%s%3N > "$OUT_DIR/testB_finished_ms"
           exit $RC
+
+      - name: Upload checkpoint artifact (Test B; metrics only)
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4.6.2
+        with:
+          name: phase0-stage3-testB-${{ github.run_id }}
+          path: |
+            out/testB_*
+            out/publish_*
+            out/testB*_ms
+          if-no-files-found: ignore
+          retention-days: 90
 
       - name: Sanitized summary
         if: always()
@@ -299,5 +347,5 @@ jobs:
       - name: Fail the run if either test failed
         if: always() && inputs.mode == 'full'
         run: |
-          echo "test_a=${{ steps.test_a.outcome }} test_b=${{ steps.test_b.outcome }}"
-          [ "${{ steps.test_a.outcome }}" = "success" ] && [ "${{ steps.test_b.outcome }}" = "success" ]
+          echo "inspection=${{ steps.inspect.outcome }} test_a=${{ steps.test_a.outcome }} test_b=${{ steps.test_b.outcome }}"
+          [ "${{ steps.inspect.outcome }}" = "success" ] && [ "${{ steps.test_a.outcome }}" = "success" ] && [ "${{ steps.test_b.outcome }}" = "success" ]
