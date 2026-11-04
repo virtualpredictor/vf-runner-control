@@ -79,6 +79,7 @@ jobs:
           ssh-keyscan -t ed25519,rsa github.com >> "$HOME/.ssh/known_hosts" 2>/dev/null
           echo "key fingerprint: $(ssh-keygen -y -f $HOME/.ssh/vf_core 2>&1 | ssh-keygen -lf - 2>&1)"; wc -l < $HOME/.ssh/vf_core
           export GIT_SSH_COMMAND="ssh -i $HOME/.ssh/vf_core -o IdentitiesOnly=yes"
+          ssh -i $HOME/.ssh/vf_core -o IdentitiesOnly=yes -vT git@github.com 2>&1 | grep -E "Offering|accepts|Authentications|denied|Hello|Host key|known_hosts|no such" | head -12 || true
           git clone --quiet --no-checkout git@github.com:virtualpredictor/vf-core.git core
           cd core
           git checkout --quiet "$CORE_SHA"
