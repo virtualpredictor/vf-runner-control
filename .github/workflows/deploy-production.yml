@@ -1,0 +1,32 @@
+name: Deploy production (guarded skeleton)
+
+# NOT ACTIVE. Production deployment needs the owner's separate explicit approval. This file only defines the gate so it cannot be
+# reached by accident: it runs in the "production" environment (required reviewer: the repository owner), needs a typed confirmation,
+# and refuses to continue until a production configuration exists in vf-core. It contains no deploy step yet.
+
+on:
+  workflow_dispatch:
+    inputs:
+      core_sha:
+        description: "vf-core commit to deploy (full 40-char SHA)"
+        required: true
+        type: string
+      confirm:
+        description: "Type DEPLOY TO PRODUCTION to continue"
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  gate:
+    if: github.event_name == 'workflow_dispatch' && github.actor == 'virtualpredictor' && inputs.confirm == 'DEPLOY TO PRODUCTION'
+    runs-on: ubuntu-latest
+    environment: production
+    timeout-minutes: 5
+    steps:
+      - name: Production configuration does not exist yet
+        run: |
+          echo "No production deployment is defined. Create ci/production/wrangler.jsonc in vf-core, review it, and extend this workflow, after the owner approves the go decision."
+          exit 1

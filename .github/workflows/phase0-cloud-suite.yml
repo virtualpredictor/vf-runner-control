@@ -39,6 +39,11 @@ on:
         required: false
         default: "90"
         type: string
+      d_scale:
+        description: "Test D (R2 capacity scenarios) duration scale, 1 = full (about 50 minutes)"
+        required: false
+        default: "1"
+        type: string
 
 permissions:
   contents: read
@@ -144,6 +149,7 @@ jobs:
       CORE_SHA: ${{ inputs.core_sha }}
       A_MINUTES: ${{ inputs.a_minutes }}
       B_MINUTES: ${{ inputs.b_minutes }}
+      D_SCALE: ${{ inputs.d_scale }}
       APP_URL: https://vf-phase0-app-staging.virtualpredictor.workers.dev
       LOCAL_BASE: http://localhost:8787
       SNAPSHOT_BASE: https://pub-3ddeb4280145459d9e18b30b357e4403.r2.dev/v1/
@@ -268,6 +274,29 @@ jobs:
           if-no-files-found: ignore
           retention-days: 90
 
+      - name: Test C - regression and integrity (API, prices, fail-closed, frontend, signed ingestion)
+        id: test_c
+        if: inputs.mode == 'full'
+        continue-on-error: true
+        working-directory: vf-core/ci
+        env:
+          INGEST_HMAC_SECRET: ${{ secrets.INGEST_HMAC_SECRET }}
+        run: |
+          date +%s%3N > "$OUT_DIR/testC_started_ms"
+          node test_c_regression.js
+          date +%s%3N > "$OUT_DIR/testC_finished_ms"
+
+      - name: Upload checkpoint artifact (Test C; metrics only)
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4.6.2
+        with:
+          name: phase0-stage1b-testC-${{ github.run_id }}
+          path: |
+            out/testC_*
+            out/testC*_ms
+          if-no-files-found: ignore
+          retention-days: 90
+
       - name: Test A - browser correctness (local server, headless Chromium)
         id: test_a
         if: inputs.mode == 'full'
@@ -307,7 +336,7 @@ jobs:
           date +%s%3N > "$OUT_DIR/testB_started_ms"
           mkdir -p "$CONTROL_DIR"
           export PUBLISH_LOG="$OUT_DIR/publish_${RUN_ID}_log.jsonl"
-          PUBLISH_MINUTES=$(( B_MINUTES + 6 )) PUBLISH_INTERVAL_S=20 node publish_snapshot.js &
+          PUBLISH_MINUTES=$(( B_MINUTES + 6 )) PUBLISH_INTERVAL_S=30 node publish_snapshot.js &
           PUB=$!
           sleep 20
           node test_b_staging.js
@@ -325,6 +354,56 @@ jobs:
             out/testB_*
             out/publish_*
             out/testB*_ms
+          if-no-files-found: ignore
+          retention-days: 90
+
+      - name: Test D - R2 read rates per visitor scenario (publisher + fresh browsers)
+        id: test_d
+        if: inputs.mode == 'full' && steps.inspect.outcome == 'success'
+        continue-on-error: true
+        working-directory: vf-core/ci
+        env:
+          PUBLISH_KEY: ${{ secrets.VF_STAGING_PUBLISH_KEY }}
+        run: |
+          set +e; set -u
+          date +%s%3N > "$OUT_DIR/testD_started_ms"
+          export PUBLISH_LOG="$OUT_DIR/publish_D_${RUN_ID}_log.jsonl"
+          PUBLISH_MINUTES=$(( 62 )) PUBLISH_INTERVAL_S=30 node publish_snapshot.js &
+          PUB=$!
+          sleep 60
+          node test_d_capacity.js
+          RC=$?
+          kill "$PUB" 2>/dev/null || true
+          date +%s%3N > "$OUT_DIR/testD_finished_ms"
+          exit $RC
+
+      - name: Capacity table from the measured scenario rates
+        if: always() && inputs.mode == 'full'
+        working-directory: vf-core/ci
+        run: |
+          D=$(ls "$OUT_DIR"/testD_*_results.json 2>/dev/null | head -1)
+          P=$(ls "$OUT_DIR"/publish_D_*_log.jsonl 2>/dev/null | head -1)
+          [ -n "$D" ] && node capacity_model.js "$D" "$P" | tee "$OUT_DIR/capacity_table.md" || echo "no Test D results"
+
+      - name: R2 quota policy check (read-only dry run)
+        if: always() && inputs.mode == 'full'
+        working-directory: vf-core/ci
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ vars.CLOUDFLARE_ACCOUNT_ID }}
+        run: node quota_guard.js --dry-run | tee "$OUT_DIR/quota_policy_check.json"
+
+      - name: Upload checkpoint artifact (Test D and capacity; metrics only)
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4.6.2
+        with:
+          name: phase0-stage4-testD-${{ github.run_id }}
+          path: |
+            out/testD_*
+            out/publish_D_*
+            out/capacity_table.md
+            out/quota_policy_check.json
+            out/testD*_ms
           if-no-files-found: ignore
           retention-days: 90
 
@@ -354,5 +433,5 @@ jobs:
       - name: Fail the run if either test failed
         if: always() && inputs.mode == 'full'
         run: |
-          echo "inspection=${{ steps.inspect.outcome }} test_a=${{ steps.test_a.outcome }} test_b=${{ steps.test_b.outcome }}"
-          [ "${{ steps.inspect.outcome }}" = "success" ] && [ "${{ steps.test_a.outcome }}" = "success" ] && [ "${{ steps.test_b.outcome }}" = "success" ]
+          echo "inspection=${{ steps.inspect.outcome }} test_c=${{ steps.test_c.outcome }} test_a=${{ steps.test_a.outcome }} test_b=${{ steps.test_b.outcome }} test_d=${{ steps.test_d.outcome }}"
+          [ "${{ steps.inspect.outcome }}" = "success" ] && [ "${{ steps.test_c.outcome }}" = "success" ] && [ "${{ steps.test_a.outcome }}" = "success" ] && [ "${{ steps.test_b.outcome }}" = "success" ] && [ "${{ steps.test_d.outcome }}" = "success" ]

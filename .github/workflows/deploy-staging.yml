@@ -1,0 +1,88 @@
+name: Deploy staging app
+
+# Deploys ONLY the staging app Worker (vf-phase0-app-staging) with a dedicated, narrowly scoped Cloudflare API token. It does not use, and
+# does not depend on, any interactive Wrangler login on anyone's computer. Manual dispatch by the repository owner only.
+# Production is a separate workflow with its own approval gate; this one refuses any other target.
+
+on:
+  workflow_dispatch:
+    inputs:
+      core_sha:
+        description: "vf-core commit to deploy (full 40-char SHA)"
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: deploy-staging
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    if: github.event_name == 'workflow_dispatch' && github.actor == 'virtualpredictor'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+      CLOUDFLARE_ACCOUNT_ID: ${{ vars.CLOUDFLARE_ACCOUNT_ID }}
+      CORE_SHA: ${{ inputs.core_sha }}
+    steps:
+      - name: Require the deployment token and account id
+        run: |
+          [ -n "$CLOUDFLARE_API_TOKEN" ] || { echo "CLOUDFLARE_API_TOKEN is not configured. See docs/CLOUDFLARE_DEPLOY_TOKEN.md in vf-core."; exit 1; }
+          [ -n "$CLOUDFLARE_ACCOUNT_ID" ] || { echo "CLOUDFLARE_ACCOUNT_ID (repository variable) is not configured."; exit 1; }
+          printf '%s' "$CORE_SHA" | grep -Eq '^[0-9a-f]{40}$' || { echo "core_sha must be a full 40-char lowercase hex SHA"; exit 1; }
+
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020  # v4.4.0
+        with:
+          node-version: "22"
+
+      - name: Private-source checkout, attempt 1
+        id: co1
+        continue-on-error: true
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
+        with:
+          repository: virtualpredictor/vf-core
+          ref: ${{ inputs.core_sha }}
+          ssh-key: ${{ secrets.VF_CORE_DEPLOY_KEY }}
+          path: vf-core
+          persist-credentials: false
+
+      - name: Pause before retry
+        if: steps.co1.outcome == 'failure'
+        run: sleep 25
+
+      - name: Private-source checkout, attempt 2
+        id: co2
+        if: steps.co1.outcome == 'failure'
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
+        with:
+          repository: virtualpredictor/vf-core
+          ref: ${{ inputs.core_sha }}
+          ssh-key: ${{ secrets.VF_CORE_DEPLOY_KEY }}
+          path: vf-core
+          persist-credentials: false
+
+      - name: Verify the token works and is scoped to this account
+        run: |
+          set -euo pipefail
+          R=$(curl -sS "https://api.cloudflare.com/client/v4/accounts/$CLOUDFLARE_ACCOUNT_ID/tokens/verify" -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN" || true)
+          echo "$R" | node -e "let s='';process.stdin.on('data',d=>s+=d).on('end',()=>{try{const j=JSON.parse(s);console.log('token verify:',j.success===true?'success':'failed',j.result&&j.result.status?('status='+j.result.status):'');process.exit(j.success===true&&j.result.status==='active'?0:1)}catch(e){console.log('token verify: unreadable answer');process.exit(1)}})"
+
+      - name: Refuse any target other than the staging Worker
+        run: |
+          set -euo pipefail
+          grep -q '"name": "vf-phase0-app-staging"' vf-core/ci/staging-app/wrangler.jsonc || { echo "target is not the staging Worker; refusing"; exit 1; }
+          ! grep -Eq '"routes"|"route"|custom_domain|ai\.virtualpredictor' vf-core/ci/staging-app/wrangler.jsonc || { echo "staging config must not declare routes or the production hostname"; exit 1; }
+
+      - name: Apply the D1 schema (idempotent) and deploy
+        working-directory: vf-core
+        run: |
+          set -euo pipefail
+          npx --yes wrangler@4.157.0 d1 execute vf-phase0-staging --remote --file ci/staging-app/schema.sql --config ci/staging-app/wrangler.jsonc
+          npx --yes wrangler@4.157.0 deploy --config ci/staging-app/wrangler.jsonc
+
+      - name: Health check
+        run: curl -fsS https://vf-phase0-app-staging.virtualpredictor.workers.dev/_health | head -c 300; echo
