@@ -50,4 +50,6 @@ jobs:
       - name: Check usage and apply the policy
         if: steps.cfg.outputs.configured == 'true'
         working-directory: vf-core
-        run: node ci/quota_guard.js | tee "$GITHUB_STEP_SUMMARY"
+        run: |
+          set -o pipefail
+          node ci/quota_guard.js | tee "$GITHUB_STEP_SUMMARY"

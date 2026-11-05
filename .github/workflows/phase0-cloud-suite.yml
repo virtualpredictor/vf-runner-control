@@ -391,7 +391,9 @@ jobs:
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           CLOUDFLARE_ACCOUNT_ID: ${{ vars.CLOUDFLARE_ACCOUNT_ID }}
-        run: node quota_guard.js --dry-run | tee "$OUT_DIR/quota_policy_check.json"
+        run: |
+          set -o pipefail
+          node quota_guard.js --dry-run | tee "$OUT_DIR/quota_policy_check.json"
 
       - name: Upload checkpoint artifact (Test D and capacity; metrics only)
         if: always()
