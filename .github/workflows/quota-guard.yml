@@ -8,6 +8,12 @@ on:
   schedule:
     - cron: "17 * * * *"
   workflow_dispatch:
+    inputs:
+      simulate_pct:
+        description: "Drill: pretend usage is this percent of the free allowance (55 exercises the warning, 75 the suspension of the idle staging bucket). Empty = real usage."
+        required: false
+        type: string
+        default: ""
 
 permissions:
   contents: read
@@ -26,6 +32,7 @@ jobs:
       APP_URL: https://vf-phase0-app-staging.virtualpredictor.workers.dev
       R2_BUCKET: vf-phase0-r2-test
       PUBLISH_KEY: ${{ secrets.VF_STAGING_PUBLISH_KEY }}
+      QUOTA_SIMULATE_PCT: ${{ inputs.simulate_pct }}
     steps:
       - name: Is the guard configured?
         id: cfg

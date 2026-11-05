@@ -6,6 +6,7 @@ name: Phase 0 Cloud Suite
 # mode=smoke  private-source checkout check only (one short job). Nothing else runs.
 # mode=preflight  checkout + real-provider source check only (about 5 minutes); no tests run.
 # mode=full   the same checkout check, then (only if it passed) Test A and Test B back to back on one runner.
+# mode=faults  regression mode plus Test B with the real fault windows (set b_minutes, about 50); no Test A, no Test D
 # mode=regression  checkout + source preflight + field inspection + Test C only (about 10 minutes); no publishing to R2.
 #             Both tests use real provider data only: if a provider is unreachable the run reports the source failure
 #             and stops, and no synthetic data is ever counted as a provider test.
@@ -29,7 +30,7 @@ on:
         required: false
         default: "smoke"
         type: choice
-        options: [smoke, preflight, full, regression]
+        options: [smoke, preflight, full, regression, faults]
       a_minutes:
         description: "Test A duration in minutes (full mode)"
         required: false
@@ -142,7 +143,7 @@ jobs:
         run: rm -rf vf-core
 
   suite:
-    if: inputs.mode == 'full' || inputs.mode == 'preflight' || inputs.mode == 'regression'
+    if: inputs.mode == 'full' || inputs.mode == 'preflight' || inputs.mode == 'regression' || inputs.mode == 'faults'
     needs: checkout-smoke
     runs-on: ubuntu-latest
     timeout-minutes: 330
@@ -275,9 +276,19 @@ jobs:
           if-no-files-found: ignore
           retention-days: 90
 
+      - name: Unit tests (includes auto-betting price integrity, feed health, snapshot allowlist)
+        id: unit
+        if: inputs.mode == 'full' || inputs.mode == 'regression' || inputs.mode == 'faults'
+        continue-on-error: true
+        working-directory: vf-core
+        run: |
+          set +e
+          node --test test/*.test.js 2>&1 | tee "$OUT_DIR/unit_tests.txt" | grep -E "^(ℹ|# )(tests|pass|fail)" || true
+          grep -E "^(ℹ|# )fail 0" "$OUT_DIR/unit_tests.txt" >/dev/null
+
       - name: Test C - regression and integrity (API, prices, fail-closed, frontend, signed ingestion)
         id: test_c
-        if: inputs.mode == 'full' || inputs.mode == 'regression'
+        if: inputs.mode == 'full' || inputs.mode == 'regression' || inputs.mode == 'faults'
         continue-on-error: true
         working-directory: vf-core/ci
         env:
@@ -320,18 +331,19 @@ jobs:
           retention-days: 90
 
       - name: Check staging Worker
-        if: inputs.mode == 'full' && steps.inspect.outcome == 'success'
+        if: (inputs.mode == 'full' || inputs.mode == 'faults') && steps.inspect.outcome == 'success'
         run: |
           set -euo pipefail
           curl -fsS "$APP_URL/_health" | head -c 300; echo
 
       - name: Test B - integrated staging run (publisher + browsers)
         id: test_b
-        if: inputs.mode == 'full' && steps.inspect.outcome == 'success'
+        if: (inputs.mode == 'full' || inputs.mode == 'faults') && steps.inspect.outcome == 'success'
         continue-on-error: true
         working-directory: vf-core/ci
         env:
           PUBLISH_KEY: ${{ secrets.VF_STAGING_PUBLISH_KEY }}
+          B_FAULT_SCALE: ${{ inputs.mode == 'faults' && '1' || '' }}
         run: |
           set +e; set -u
           date +%s%3N > "$OUT_DIR/testB_started_ms"
@@ -411,7 +423,7 @@ jobs:
           retention-days: 90
 
       - name: Cleanup - revoke the public snapshot objects (does not need any Cloudflare login)
-        if: always() && inputs.mode == 'full'
+        if: always() && (inputs.mode == 'full' || inputs.mode == 'faults')
         working-directory: vf-core/ci
         env:
           PUBLISH_KEY: ${{ secrets.VF_STAGING_PUBLISH_KEY }}
