@@ -336,7 +336,7 @@ jobs:
           date +%s%3N > "$OUT_DIR/testB_started_ms"
           mkdir -p "$CONTROL_DIR"
           export PUBLISH_LOG="$OUT_DIR/publish_${RUN_ID}_log.jsonl"
-          PUBLISH_MINUTES=$(( B_MINUTES + 6 )) PUBLISH_INTERVAL_S=30 node publish_snapshot.js &
+          PUBLISH_MINUTES=$(( B_MINUTES + 6 )) node publish_snapshot.js &
           PUB=$!
           sleep 20
           node test_b_staging.js
@@ -368,7 +368,7 @@ jobs:
           set +e; set -u
           date +%s%3N > "$OUT_DIR/testD_started_ms"
           export PUBLISH_LOG="$OUT_DIR/publish_D_${RUN_ID}_log.jsonl"
-          PUBLISH_MINUTES=$(( 62 )) PUBLISH_INTERVAL_S=30 node publish_snapshot.js &
+          PUBLISH_MINUTES=$(( 62 )) node publish_snapshot.js &
           PUB=$!
           sleep 60
           node test_d_capacity.js

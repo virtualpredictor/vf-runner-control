@@ -11,6 +11,11 @@ on:
         description: "vf-core commit to deploy (full 40-char SHA)"
         required: true
         type: string
+      rollback_test:
+        description: "After deploying, roll back to the previous version, check health, then restore this one"
+        required: false
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -95,3 +100,26 @@ jobs:
 
       - name: Health check
         run: curl -fsS https://vf-phase0-app-staging.virtualpredictor.workers.dev/_health | head -c 300; echo
+
+      - name: Rollback test (staging only)
+        if: ${{ inputs.rollback_test }}
+        working-directory: vf-core
+        run: |
+          set -euo pipefail
+          H=https://vf-phase0-app-staging.virtualpredictor.workers.dev/_health
+          npx --yes wrangler@4.157.0 versions list --config ci/staging-app/wrangler.jsonc --json > /tmp/versions.json
+          cat > /tmp/prev.js <<'EOF'
+          const v = JSON.parse(require('fs').readFileSync('/tmp/versions.json', 'utf8'));
+          const when = x => Date.parse((x.metadata && x.metadata.created_on) || x.created_on || 0);
+          console.error('versions listed:', v.length);
+          if (v.length < 2) { console.error('no earlier version to roll back to'); process.exit(3); }
+          v.sort((a, b) => when(b) - when(a));
+          console.log(v[1].id);
+          EOF
+          PREV=$(node /tmp/prev.js)
+          echo "rolling back to the previous version"
+          npx --yes wrangler@4.157.0 rollback "$PREV" --config ci/staging-app/wrangler.jsonc --message "rollback test" --yes
+          sleep 5; curl -fsS "$H" | head -c 200; echo
+          echo "restoring the deployed version"
+          npx --yes wrangler@4.157.0 deploy --config ci/staging-app/wrangler.jsonc
+          sleep 5; curl -fsS "$H" | head -c 200; echo
