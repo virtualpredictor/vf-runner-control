@@ -6,6 +6,7 @@ name: Phase 0 Cloud Suite
 # mode=smoke  private-source checkout check only (one short job). Nothing else runs.
 # mode=preflight  checkout + real-provider source check only (about 5 minutes); no tests run.
 # mode=full   the same checkout check, then (only if it passed) Test A and Test B back to back on one runner.
+# mode=regression  checkout + source preflight + field inspection + Test C only (about 10 minutes); no publishing to R2.
 #             Both tests use real provider data only: if a provider is unreachable the run reports the source failure
 #             and stops, and no synthetic data is ever counted as a provider test.
 #
@@ -28,7 +29,7 @@ on:
         required: false
         default: "smoke"
         type: choice
-        options: [smoke, preflight, full]
+        options: [smoke, preflight, full, regression]
       a_minutes:
         description: "Test A duration in minutes (full mode)"
         required: false
@@ -141,7 +142,7 @@ jobs:
         run: rm -rf vf-core
 
   suite:
-    if: inputs.mode == 'full' || inputs.mode == 'preflight'
+    if: inputs.mode == 'full' || inputs.mode == 'preflight' || inputs.mode == 'regression'
     needs: checkout-smoke
     runs-on: ubuntu-latest
     timeout-minutes: 330
@@ -276,7 +277,7 @@ jobs:
 
       - name: Test C - regression and integrity (API, prices, fail-closed, frontend, signed ingestion)
         id: test_c
-        if: inputs.mode == 'full'
+        if: inputs.mode == 'full' || inputs.mode == 'regression'
         continue-on-error: true
         working-directory: vf-core/ci
         env:
