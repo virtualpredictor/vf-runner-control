@@ -65,11 +65,20 @@ jobs:
           path: vf-core
           persist-credentials: false
 
-      - name: Verify the token works and is scoped to this account
+      - name: Verify the token works (account-owned or user-owned) and can see only this account
         run: |
-          set -euo pipefail
-          R=$(curl -sS "https://api.cloudflare.com/client/v4/accounts/$CLOUDFLARE_ACCOUNT_ID/tokens/verify" -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN" || true)
-          echo "$R" | node -e "let s='';process.stdin.on('data',d=>s+=d).on('end',()=>{try{const j=JSON.parse(s);console.log('token verify:',j.success===true?'success':'failed',j.result&&j.result.status?('status='+j.result.status):'');process.exit(j.success===true&&j.result.status==='active'?0:1)}catch(e){console.log('token verify: unreadable answer');process.exit(1)}})"
+          set -u
+          A="https://api.cloudflare.com/client/v4"
+          H="Authorization: Bearer $CLOUDFLARE_API_TOKEN"
+          OK=0
+          for url in "$A/accounts/$CLOUDFLARE_ACCOUNT_ID/tokens/verify" "$A/user/tokens/verify"; do
+            curl -sS -H "$H" "$url" -o /tmp/v.json || true
+            if node -e "const j=JSON.parse(require('fs').readFileSync('/tmp/v.json','utf8'));process.exit(j.success===true&&j.result.status==='active'?0:1)" 2>/dev/null; then echo "token verify: success (active)"; OK=1; break; fi
+          done
+          [ "$OK" = "1" ] || { echo "token verify: failed"; exit 1; }
+          # the token must see exactly one account, the project account
+          curl -sS -H "$H" "$A/accounts" -o /tmp/a.json
+          node -e "const j=JSON.parse(require('fs').readFileSync('/tmp/a.json','utf8'));const ids=(j.result||[]).map(a=>a.id);console.log('accounts visible to the token:',ids.length);process.exit(ids.length===1&&ids[0]===process.env.CLOUDFLARE_ACCOUNT_ID?0:1)" || { echo "token can see other accounts, or not this one; refusing"; exit 1; }
 
       - name: Refuse any target other than the staging Worker
         run: |
