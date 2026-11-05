@@ -21,6 +21,8 @@ jobs:
         run: |
           set -u
           [ -n "$CLOUDFLARE_API_TOKEN" ] || { echo "no token configured"; exit 1; }
+          # Shape of the stored value only: length, public prefix and stray characters. The value itself is never printed.
+          node -e "const t=process.env.CLOUDFLARE_API_TOKEN;const m=t.match(/^(cf[a-z]{2})_/);console.log('stored value: length',t.length,'| prefix',m?m[1]+'_':'(none recognised)','| leading/trailing whitespace',t!==t.trim()?'YES':'no','| contains whitespace inside',/s/.test(t.trim())?'YES':'no','| non-ASCII characters',/[^ -~]/.test(t)?'YES':'no')"
           A="https://api.cloudflare.com/client/v4"
           H="Authorization: Bearer $CLOUDFLARE_API_TOKEN"
           probe() { # name url
