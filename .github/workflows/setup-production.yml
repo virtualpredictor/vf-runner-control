@@ -1,0 +1,72 @@
+name: Set up production resources (gated, one time)
+
+# Creates the PRODUCTION resources the production Worker binds, only if they do not exist yet, and prints their non-secret ids:
+#   D1  vf-prod              (store of record for the publish heartbeat)
+#   R2  vf-prod-snapshots    (public board snapshots: gets its r2.dev URL and a CORS rule for https://ai.virtualpredictor.workers.dev)
+#   R2  vf-prod-state        (PRIVATE collector history; never given a public URL)
+# It never modifies or deletes an existing resource, never touches staging, and deploys nothing. Owner-only, waits in the
+# "production" environment for the required reviewer, and needs a typed confirmation.
+
+on:
+  workflow_dispatch:
+    inputs:
+      core_sha:
+        description: "vf-core commit that holds ci/production (full 40-char SHA)"
+        required: true
+        type: string
+      confirm:
+        description: "Type CREATE PRODUCTION RESOURCES to continue"
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: deploy-production
+  cancel-in-progress: false
+
+jobs:
+  setup:
+    if: github.event_name == 'workflow_dispatch' && github.actor == 'virtualpredictor' && inputs.confirm == 'CREATE PRODUCTION RESOURCES'
+    runs-on: ubuntu-latest
+    environment: production
+    timeout-minutes: 10
+    env:
+      CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+      CLOUDFLARE_ACCOUNT_ID: ${{ vars.CLOUDFLARE_ACCOUNT_ID }}
+      W: npx --yes wrangler@4.157.0
+    steps:
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020  # v4.4.0
+        with:
+          node-version: "22"
+
+      - name: Private-source checkout (for the CORS rule)
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
+        with:
+          repository: virtualpredictor/vf-core
+          ref: ${{ inputs.core_sha }}
+          ssh-key: ${{ secrets.VF_CORE_DEPLOY_KEY }}
+          path: vf-core
+          persist-credentials: false
+
+      - name: Create what is missing (never changes existing resources)
+        working-directory: vf-core
+        run: |
+          set -euo pipefail
+          $W d1 list --json > /tmp/d1.json
+          node -e "const l=JSON.parse(require('fs').readFileSync('/tmp/d1.json','utf8'));process.exit(l.some(d=>d.name==='vf-prod')?0:1)" && echo "D1 vf-prod exists" || $W d1 create vf-prod
+          for b in vf-prod-snapshots vf-prod-state; do
+            $W r2 bucket list | grep -q "name: *$b\$" && echo "R2 $b exists" || $W r2 bucket create "$b"
+          done
+          $W r2 bucket cors set vf-prod-snapshots --file ci/production/r2-cors.json -y
+          $W r2 bucket dev-url enable vf-prod-snapshots -y
+          # the state bucket must stay private
+          $W r2 bucket dev-url get vf-prod-state | tail -1
+
+      - name: Print the ids for ci/production/wrangler.jsonc (non-secret)
+        run: |
+          set -euo pipefail
+          $W d1 list --json > /tmp/d1.json
+          node -e "const l=JSON.parse(require('fs').readFileSync('/tmp/d1.json','utf8'));const d=l.find(x=>x.name==='vf-prod');console.log('__PROD_D1_ID__ =',d&&(d.uuid||d.id))" | tee -a "$GITHUB_STEP_SUMMARY"
+          echo "__PROD_SNAPSHOT_BASE__ = $($W r2 bucket dev-url get vf-prod-snapshots | grep -Eo 'https://pub-[a-z0-9]+\.r2\.dev' | head -1)/v1/" | tee -a "$GITHUB_STEP_SUMMARY"

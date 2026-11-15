@@ -106,6 +106,23 @@ jobs:
       - name: Health check
         run: curl -fsS https://vf-phase0-app-staging.virtualpredictor.workers.dev/_health | head -c 300; echo
 
+      - name: History store round trip on real Cloudflare (save, then restore into an empty folder)
+        working-directory: vf-core
+        env:
+          APP_URL: https://vf-phase0-app-staging.virtualpredictor.workers.dev
+          PUBLISH_KEY: ${{ secrets.VF_STAGING_PUBLISH_KEY }}
+        run: |
+          set -euo pipefail
+          A="$RUNNER_TEMP/state-a"; B="$RUNNER_TEMP/state-b"; mkdir -p "$A" "$B"
+          cp data/history/*.json "$A/"
+          node ci/state_sync.js get "$A"
+          node ci/state_sync.js put "$A" | tee /tmp/put.json
+          grep -q '"sportybet":"saved' /tmp/put.json && grep -q '"betpawa":"saved' /tmp/put.json
+          node ci/state_sync.js get "$B" | tee /tmp/get.json
+          grep -c '"result":"restored"' /tmp/get.json | grep -qx 2
+          # unsigned reads are refused
+          test "$(curl -s -o /dev/null -w '%{http_code}' "$APP_URL/_state?bm=sportybet")" = "401"
+
       - name: Rollback test (staging only)
         if: ${{ inputs.rollback_test }}
         working-directory: vf-core
