@@ -39,4 +39,6 @@ jobs:
 
       - name: Revoke and verify
         working-directory: vf-core
-        run: node ci/revoke.js | tee "$GITHUB_STEP_SUMMARY"
+        run: |
+          set -o pipefail
+          node ci/revoke.js | tee "$GITHUB_STEP_SUMMARY"
