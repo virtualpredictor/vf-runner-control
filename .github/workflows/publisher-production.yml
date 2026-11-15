@@ -1,0 +1,112 @@
+name: Production publisher (chained)
+
+# Keeps the production board fed on the free tier with a chain of ephemeral GitHub-hosted jobs. Each job:
+#   1. restores the collector history from the private state store (the Worker's signed /_state endpoint),
+#   2. runs the real-data-only server and the snapshot publisher against https://ai.virtualpredictor.workers.dev for about 5h40m,
+#   3. saves the history every 10 minutes and once more at the end,
+#   4. queues the next job before it finishes.
+# A 15-minute schedule is the watchdog: if the chain breaks, the next tick starts a job. Only one job runs at a time (one provider
+# session per terminal identifier); a second one waits in the queue. Expect a short gap at every hand-over and occasional schedule
+# delays: the site then shows its stale-data banner until the next job publishes. Best effort, not a guaranteed always-on service.
+#
+# OFF until the owner enables it: every run exits at once unless the repository variable VF_PUBLISHER_ENABLED is "true" and
+# VF_PROD_CORE_SHA names the vf-core commit that was deployed to production.
+
+on:
+  schedule:
+    - cron: "7,22,37,52 * * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  actions: write          # queue the next job of the chain
+
+concurrency:
+  group: vf-provider-session
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    if: vars.VF_PUBLISHER_ENABLED == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 355
+    env:
+      APP_URL: https://ai.virtualpredictor.workers.dev
+      LOCAL_BASE: http://localhost:8787
+      CORE_SHA: ${{ vars.VF_PROD_CORE_SHA }}
+      PUBLISH_KEY: ${{ secrets.VF_PROD_PUBLISH_KEY }}
+      STATE_DIR: ${{ github.workspace }}/state
+      RUN_MINUTES: "340"
+    steps:
+      - name: Check the configuration
+        run: |
+          set -eu
+          printf '%s' "$CORE_SHA" | grep -Eq '^[0-9a-f]{40}$' || { echo "VF_PROD_CORE_SHA must be the full deployed vf-core SHA"; exit 1; }
+          [ -n "$PUBLISH_KEY" ] || { echo "VF_PROD_PUBLISH_KEY is not configured"; exit 1; }
+
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020  # v4.4.0
+        with:
+          node-version: "22"
+
+      - name: Private-source checkout (the deployed commit)
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
+        with:
+          repository: virtualpredictor/vf-core
+          ref: ${{ vars.VF_PROD_CORE_SHA }}
+          ssh-key: ${{ secrets.VF_CORE_DEPLOY_KEY }}
+          path: vf-core
+          persist-credentials: false
+
+      - name: Restore the collector history
+        working-directory: vf-core
+        run: |
+          set -euo pipefail
+          mkdir -p "$STATE_DIR"
+          cp data/history/*.json "$STATE_DIR/"          # seed copy, replaced by the saved history when one exists
+          node ci/state_sync.js get "$STATE_DIR"
+
+      - name: Start the server (real provider data only)
+        working-directory: vf-core
+        env:
+          VF_REAL_DATA_ONLY: "1"
+          VF_HISTORY_DIR: ${{ github.workspace }}/state
+          VF_AUTOBET_SESSION_FILE: ${{ github.workspace }}/state/autobet_session.json
+          VIRTUSTEC_HW_ID: ${{ secrets.VIRTUSTEC_HW_ID }}
+        run: |
+          set -euo pipefail
+          nohup node server.js > "$RUNNER_TEMP/server.log" 2>&1 &
+          for i in $(seq 1 90); do curl -s -o /dev/null "$LOCAL_BASE/api/source-status" && { echo "server up after ${i}s"; break; }; sleep 1; done
+
+      - name: Publish, saving the history every 10 minutes
+        id: publish
+        working-directory: vf-core/ci
+        run: |
+          set -u
+          node state_sync.js loop "$STATE_DIR" 10 > "$RUNNER_TEMP/state.log" 2>&1 &
+          SYNC=$!
+          PUBLISH_MINUTES="$RUN_MINUTES" PUBLISH_LOG="$RUNNER_TEMP/publish.jsonl" node publish_snapshot.js
+          RC=$?
+          kill -TERM "$SYNC" 2>/dev/null; wait "$SYNC" 2>/dev/null || true
+          tail -3 "$RUNNER_TEMP/state.log" || true
+          exit $RC
+
+      - name: Final history save
+        if: always() && steps.publish.outcome != 'skipped'
+        working-directory: vf-core
+        run: node ci/state_sync.js put "$STATE_DIR" || true
+
+      - name: Queue the next job of the chain
+        if: always() && vars.VF_PUBLISHER_ENABLED == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh workflow run publisher-production.yml --repo "$GITHUB_REPOSITORY" || echo "could not queue; the 15-minute watchdog will start the next job"
+
+      - name: Summary (counts only)
+        if: always()
+        run: |
+          {
+            echo "publish cycles: $(grep -c cycle_done "$RUNNER_TEMP/publish.jsonl" 2>/dev/null || echo 0)"
+            echo "objects written: $(grep -c '"put":' "$RUNNER_TEMP/publish.jsonl" 2>/dev/null || echo 0)"
+            echo "server error lines: $(grep -ci error "$RUNNER_TEMP/server.log" 2>/dev/null || echo 0)"
+            echo "state saves: $(grep -c '"state":"put"' "$RUNNER_TEMP/state.log" 2>/dev/null || echo 0)"
+          } | tee "$GITHUB_STEP_SUMMARY"

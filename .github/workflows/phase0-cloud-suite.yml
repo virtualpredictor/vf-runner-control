@@ -62,6 +62,10 @@ jobs:
     env:
       CORE_SHA: ${{ inputs.core_sha }}
     steps:
+      - name: Refuse while the production publisher is enabled (one provider session per terminal identifier)
+        run: |
+          if [ "${{ vars.VF_PUBLISHER_ENABLED }}" = "true" ]; then echo "The production publisher is enabled and holds the provider session. Pause it (VF_PUBLISHER_ENABLED=false) before running provider tests."; exit 1; fi
+
       - name: Validate the pinned commit input
         run: |
           set -euo pipefail

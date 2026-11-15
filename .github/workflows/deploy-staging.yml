@@ -98,6 +98,8 @@ jobs:
           # The Worker serves the built public site (anonymous, accounts-off pages; no account pages or data files). The build fails
           # if any page still links to an account page or carries a logged-in header.
           node ci/build_site.js
+          # The private state bucket (collector history between runner jobs). Created once; never given a public URL.
+          npx --yes wrangler@4.157.0 r2 bucket list | grep -q 'vf-phase0-state' || npx --yes wrangler@4.157.0 r2 bucket create vf-phase0-state
           npx --yes wrangler@4.157.0 d1 execute vf-phase0-staging --remote --file ci/staging-app/schema.sql --config ci/staging-app/wrangler.jsonc
           npx --yes wrangler@4.157.0 deploy --config ci/staging-app/wrangler.jsonc
 
