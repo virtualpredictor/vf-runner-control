@@ -1,0 +1,42 @@
+name: Revoke staging public objects
+
+# Emergency revocation for the STAGING app only: asks the staging Worker (signed request) to delete every public object
+# (v1/ snapshots and pages/ board pages) and checks that the board page is gone. It needs no Cloudflare login and contacts no provider.
+# Manual dispatch by the repository owner only.
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: revoke-staging
+  cancel-in-progress: false
+
+jobs:
+  revoke:
+    if: github.event_name == 'workflow_dispatch' && github.actor == 'virtualpredictor'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    env:
+      APP_URL: https://vf-phase0-app-staging.virtualpredictor.workers.dev
+      SNAPSHOT_BASE: https://pub-3ddeb4280145459d9e18b30b357e4403.r2.dev/v1/
+      PUBLISH_KEY: ${{ secrets.VF_STAGING_PUBLISH_KEY }}
+    steps:
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020  # v4.4.0
+        with:
+          node-version: "22"
+
+      - name: Private-source checkout (the revoke script lives in vf-core)
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
+        with:
+          repository: virtualpredictor/vf-core
+          ref: phase0/remediation
+          ssh-key: ${{ secrets.VF_CORE_DEPLOY_KEY }}
+          path: vf-core
+          persist-credentials: false
+
+      - name: Revoke and verify
+        working-directory: vf-core
+        run: node ci/revoke.js | tee "$GITHUB_STEP_SUMMARY"
