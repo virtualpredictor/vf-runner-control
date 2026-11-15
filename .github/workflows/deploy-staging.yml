@@ -95,6 +95,9 @@ jobs:
         working-directory: vf-core
         run: |
           set -euo pipefail
+          # The Worker serves the built public site (anonymous, accounts-off pages; no account pages or data files). The build fails
+          # if any page still links to an account page or carries a logged-in header.
+          node ci/build_site.js
           npx --yes wrangler@4.157.0 d1 execute vf-phase0-staging --remote --file ci/staging-app/schema.sql --config ci/staging-app/wrangler.jsonc
           npx --yes wrangler@4.157.0 deploy --config ci/staging-app/wrangler.jsonc
 
