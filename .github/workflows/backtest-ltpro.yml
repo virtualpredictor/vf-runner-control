@@ -1,0 +1,59 @@
+name: Backtest LT Pro v2 (read-only)
+
+# Reads the production collector history through the Worker's signed GET /_state (never a save) and runs the walk-forward backtest of
+# LT Pro v2 against the live models' real picks (vf-core ci/backtest_ltpro.js). Prints aggregate tables only. Does not use the provider,
+# so it can run while the publisher runs. Manual dispatch by the owner.
+
+on:
+  workflow_dispatch:
+    inputs:
+      core_sha:
+        description: "vf-core commit that has ci/backtest_ltpro.js (full 40-char SHA)"
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: backtest-ltpro
+  cancel-in-progress: false
+
+jobs:
+  backtest:
+    if: github.actor == 'virtualpredictor'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Check the input
+        env:
+          CORE_SHA: ${{ inputs.core_sha }}
+        run: printf '%s' "$CORE_SHA" | grep -Eq '^[0-9a-f]{40}$' || { echo "core_sha must be a full 40-char lowercase hex SHA"; exit 1; }
+
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020  # v4.4.0
+        with:
+          node-version: "22"
+
+      - name: Private-source checkout
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
+        with:
+          repository: virtualpredictor/vf-core
+          ref: ${{ inputs.core_sha }}
+          ssh-key: ${{ secrets.VF_CORE_DEPLOY_KEY }}
+          path: vf-core
+          persist-credentials: false
+
+      - name: Restore the production history (signed read only)
+        working-directory: vf-core
+        env:
+          APP_URL: https://ai.virtualpredictor.workers.dev
+          PUBLISH_KEY: ${{ secrets.VF_PROD_PUBLISH_KEY }}
+        run: node ci/state_sync.js get "$RUNNER_TEMP/history"
+
+      - name: Backtest
+        working-directory: vf-core
+        run: |
+          set -o pipefail
+          node ci/backtest_ltpro.js "$RUNNER_TEMP/history" | tee "$RUNNER_TEMP/backtest.txt"
+          { echo '```'; cat "$RUNNER_TEMP/backtest.txt"; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+          rm -rf "$RUNNER_TEMP/history"
