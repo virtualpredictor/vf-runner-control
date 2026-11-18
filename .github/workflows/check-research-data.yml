@@ -1,0 +1,70 @@
+name: Check research data and backups (read-only)
+
+# Downloads, through the Worker's signed GET /_state (never a save), the research files of the last days, the current history and
+# the dated daily backups of today and yesterday, and prints counts only (vf-core ci/research_summary.js): rounds, matches with a full
+# price list, result data, half-time scores. Never prints prices, results or keys. Does not use the provider, so it can run while the
+# publisher runs. Manual dispatch by the owner.
+
+on:
+  workflow_dispatch:
+    inputs:
+      core_sha:
+        description: "vf-core commit that has ci/research_summary.js (full 40-char SHA)"
+        required: true
+        type: string
+      days:
+        description: "research days to check (1-14)"
+        required: false
+        default: "2"
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: check-research-data
+  cancel-in-progress: false
+
+jobs:
+  check:
+    if: github.actor == 'virtualpredictor'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Check the inputs
+        env:
+          CORE_SHA: ${{ inputs.core_sha }}
+          DAYS: ${{ inputs.days }}
+        run: |
+          printf '%s' "$CORE_SHA" | grep -Eq '^[0-9a-f]{40}$' || { echo "core_sha must be a full 40-char lowercase hex SHA"; exit 1; }
+          printf '%s' "$DAYS" | grep -Eq '^([1-9]|1[0-4])$' || { echo "days must be 1-14"; exit 1; }
+
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020  # v4.4.0
+        with:
+          node-version: "22"
+
+      - name: Private-source checkout
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
+        with:
+          repository: virtualpredictor/vf-core
+          ref: ${{ inputs.core_sha }}
+          ssh-key: ${{ secrets.VF_CORE_DEPLOY_KEY }}
+          path: vf-core
+          persist-credentials: false
+
+      - name: Download (signed reads only) and summarise
+        working-directory: vf-core
+        env:
+          APP_URL: https://ai.virtualpredictor.workers.dev
+          PUBLISH_KEY: ${{ secrets.VF_PROD_PUBLISH_KEY }}
+          DAYS: ${{ inputs.days }}
+        run: |
+          set -euo pipefail
+          D="$RUNNER_TEMP/research"
+          node ci/state_sync.js get "$D"
+          node ci/state_sync.js get-extra "$D" "$DAYS"
+          node ci/state_sync.js get-daily "$D" "$(date -u +%F)"
+          node ci/state_sync.js get-daily "$D" "$(date -u -d yesterday +%F)"
+          node ci/research_summary.js "$D" | tee "$RUNNER_TEMP/summary.txt"
+          { echo '```'; cat "$RUNNER_TEMP/summary.txt"; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+          rm -rf "$D"
